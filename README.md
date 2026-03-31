@@ -50,6 +50,27 @@ The 0.8s headline number uses an aggressive benchmark config (`FRI_QUERIES=1`, ~
 
 Production configs have larger recursion circuits (BatchFRI grows from 2^12 to 2^19) which increases compress time significantly. However, all core optimizations — GPU acceleration, shape tuning, batching, LDE caching, batch inversion, etc. — apply equally to production configs. The estimated production improvement is **~4-6x over unmodified SP1** (vs 63x at benchmark config).
 
+### Production Throughput
+
+On a single M3 Pro at production FRI config (~8-15s per proof):
+
+| Use Case | Throughput Needed | Single M3 Pro | Notes |
+|----------|------------------|---------------|-------|
+| On-chain attestation (periodic) | 1 proof/min | Sufficient | Ample headroom |
+| Bridge (per-block, 12s slots) | 5 proofs/min | Borderline | Depends on program complexity |
+| High-throughput rollup | 10+ proofs/min | Insufficient | Needs parallel provers |
+| Real-time proving | Sub-second | Insufficient | Only achievable at benchmark config |
+
+### Scaling Strategies
+
+Proof generation is embarrassingly parallel — each proof is independent:
+
+- **Horizontal scaling:** Run N prover instances on N machines for Nx throughput. All per-prover optimizations multiply with the number of instances.
+- **Bigger hardware:** M3 Max/Ultra (more GPU cores, more RAM) or server GPUs (NVIDIA A100) would reduce per-proof time further.
+- **Proof aggregation:** Batch multiple transactions into a single proof to amortize the fixed proving overhead.
+
+A typical production deployment would run multiple prover instances behind a job queue, with each instance benefiting from the full set of MetalSPONE optimizations.
+
 ## What Changed
 
 ### Metal GPU Acceleration (Proof Generation)

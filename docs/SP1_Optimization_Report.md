@@ -365,11 +365,31 @@ The 0.8s headline number uses an aggressive benchmark config (`FRI_QUERIES=1`, ~
 
 At production config, the recursion circuit grows significantly (BatchFRI from 2^12 to 2^19), increasing compress time. However, all core optimizations — GPU acceleration, shape tuning, batching, LDE caching, batch inversion, backtrace removal, etc. — carry over fully. The estimated production improvement is **~4-6× over unmodified SP1**.
 
-For production throughput on a single M3 Pro:
-- **Proof generation:** ~8-15s per Fibonacci proof (production FRI config)
-- **Proof verification (off-chain):** ~1-10ms — trivially fast
-- **Proof verification (on-chain):** ~150K gas (Groth16) — standard for ZK on Ethereum
-- **Throughput scaling:** Proof generation parallelizes across machines; each prover instance is independent
+### Production Throughput (Single M3 Pro)
+
+At production FRI config (~8-15s per Fibonacci proof generation):
+
+| Use Case | Throughput Needed | Single M3 Pro | Notes |
+|----------|------------------|---------------|-------|
+| On-chain attestation (periodic) | 1 proof/min | Sufficient | Ample headroom |
+| Bridge (per-block, 12s slots) | 5 proofs/min | Borderline | Depends on program complexity |
+| High-throughput rollup | 10+ proofs/min | Insufficient | Needs parallel provers |
+| Real-time proving | Sub-second | Insufficient | Only achievable at benchmark config |
+
+For comparison, proof verification remains trivially fast at all configs:
+- **Off-chain verification:** ~1-10ms (STARK verification)
+- **On-chain verification:** ~150K gas (Groth16 on Ethereum), ~350K gas (PLONK)
+
+### Scaling Strategies
+
+Proof generation is embarrassingly parallel — each proof is independent:
+
+- **Horizontal scaling:** Run N prover instances on N machines for N× throughput. All per-prover optimizations multiply with the number of instances.
+- **Bigger hardware:** M3 Max/Ultra (more GPU cores, more RAM) or server GPUs (NVIDIA A100) would reduce per-proof time further.
+- **Proof aggregation:** Batch multiple transactions into a single proof to amortize the fixed proving overhead.
+- **Pipeline parallelism:** For multi-shard programs, prove\_core and compress can overlap across shards (already implemented in MetalSPONE's 3-thread pipeline).
+
+A typical production deployment would run multiple prover instances behind a job queue, with each instance benefiting from the full set of optimizations documented in this report.
 
 ---
 
