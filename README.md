@@ -1,4 +1,4 @@
-# MetalSPONE
+# 🥄✨ MetalSPONE
 
 **SP1 Prover Optimization for Apple Silicon — 63x faster proving on an 18GB M3 Pro**
 
