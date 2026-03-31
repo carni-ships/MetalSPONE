@@ -1,38 +1,42 @@
-# SP1 ZK Prover Optimization Report
+# SP1 ZK Proof Generation Optimization Report
 
 ## 18GB M3 Pro Mac — 21 Sessions, 60+ Optimizations
 
-**Result: 50.5s → 0.8s (63× speedup)**
+**Result: Proof generation time reduced from 50.5s → 0.8s (63× speedup)**
 
 **Date:** March 2026
 **Platform:** Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM)
 **Target:** SP1 v4.0.0 ZK Prover — Fibonacci benchmark (prove\_core + compress, VERIFY\_VK=false)
+
+> **Scope:** This report covers **proof generation** (the computationally expensive prover operation), not proof verification. In ZK proof systems, generation is O(n) and takes seconds to minutes, while verification is O(log n) and takes milliseconds. Proof verification was already near-instant (~1-10ms off-chain, ~150K gas on-chain for Groth16) and is not a bottleneck. All timings in this report are proof generation times unless explicitly stated otherwise.
 
 ---
 
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [Performance Timeline](#2-performance-timeline)
-3. [Resource Requirements Comparison](#3-resource-requirements-comparison)
-4. [Optimization Details by Phase](#4-optimization-details-by-phase)
+2. [Proof Generation vs Verification](#2-proof-generation-vs-verification)
+3. [Performance Timeline](#3-performance-timeline)
+4. [Resource Requirements Comparison](#4-resource-requirements-comparison)
+5. [Optimization Details by Phase](#5-optimization-details-by-phase)
    - [Phase 1: GPU Integration](#phase-1-gpu-integration-sessions-1-5--505s--316s)
    - [Phase 2: Metal NTT Kernel Optimizations](#phase-2-metal-ntt-kernel-optimizations-sessions-2-5)
    - [Phase 3: FRI/PCS Open Optimizations](#phase-3-fripcs-open-optimizations-sessions-5-8--316s--11s)
    - [Phase 4: Constraint & Trace Optimizations](#phase-4-constraint--trace-optimizations-sessions-9-14--11s--65s)
    - [Phase 5: Shape & FRI Config Tuning](#phase-5-shape--fri-config-tuning-sessions-16-20--65s--08s)
    - [Phase 6: Final Assessment](#phase-6-final-assessment-session-21--08s-confirmed)
-5. [Architectural Differences](#5-architectural-differences)
-6. [Phase Breakdown at 0.8s](#6-phase-breakdown-at-08s)
-7. [Build Configuration](#7-build-configuration)
-8. [Soundness Considerations](#8-soundness-considerations)
-9. [Remaining Bottlenecks](#9-remaining-bottlenecks)
+6. [Architectural Differences](#6-architectural-differences)
+7. [Phase Breakdown at 0.8s](#7-phase-breakdown-at-08s)
+8. [Build Configuration](#8-build-configuration)
+9. [Soundness Considerations](#9-soundness-considerations)
+10. [Production Readiness](#10-production-readiness)
+11. [Remaining Bottlenecks](#11-remaining-bottlenecks)
 
 ---
 
 ## 1. Executive Summary
 
-This report documents a systematic optimization effort applied to the SP1 v4.0.0 zero-knowledge STARK prover, targeting a memory-constrained 18GB Apple M3 Pro laptop. Over 21 sessions and 60+ individual optimizations, the Fibonacci benchmark proving time was reduced from **50.5 seconds to 0.8 seconds** — a **63× speedup**.
+This report documents a systematic optimization effort applied to the **proof generation** pipeline of the SP1 v4.0.0 zero-knowledge STARK prover, targeting a memory-constrained 18GB Apple M3 Pro laptop. Over 21 sessions and 60+ individual optimizations, the Fibonacci benchmark proof generation time was reduced from **50.5 seconds to 0.8 seconds** — a **63× speedup**.
 
 The optimizations span six categories:
 
@@ -47,7 +51,26 @@ At the 0.8s floor, costs are well-distributed across 10+ sub-phases with no sing
 
 ---
 
-## 2. Performance Timeline
+## 2. Proof Generation vs Verification
+
+ZK proof systems have two fundamentally different operations:
+
+| | Proof Generation (Prover) | Proof Verification (Verifier) |
+|---|---|---|
+| **What it does** | Generates a cryptographic proof that a computation was executed correctly | Checks that a proof is valid |
+| **Computational cost** | O(n) — proportional to computation size | O(log n) — logarithmic, near-instant |
+| **Typical time** | Seconds to minutes | Milliseconds |
+| **Hardware needs** | Multi-core CPU + GPU, GBs of RAM | Minimal — runs on any device |
+| **This project's result** | **50.5s → 0.8s (63× faster)** | Unchanged (~1-10ms off-chain) |
+| **On-chain (Ethereum)** | N/A (done off-chain) | ~150K gas (Groth16) / ~350K gas (PLONK) |
+
+Proof generation is the bottleneck in all ZK systems. The prover must perform polynomial arithmetic over the entire execution trace (NTT/DFT, Merkle tree construction, FRI commitment, constraint evaluation), while the verifier only checks a logarithmic number of openings.
+
+**This entire project optimizes proof generation.** Proof verification was already near-instant and required no optimization.
+
+---
+
+## 3. Performance Timeline (Proof Generation)
 
 | Session | Median Time | Cumulative Speedup | Key Change |
 |---------|-------------|--------------------|--------------------------------------------|
@@ -64,7 +87,7 @@ At the 0.8s floor, costs are well-distributed across 10+ sub-phases with no sing
 
 ---
 
-## 3. Resource Requirements Comparison
+## 4. Resource Requirements Comparison (Proof Generation)
 
 ### Original Unmodified SP1 v4.0.0
 
@@ -117,7 +140,7 @@ At the 0.8s floor, costs are well-distributed across 10+ sub-phases with no sing
 
 ---
 
-## 4. Optimization Details by Phase
+## 5. Optimization Details by Phase (Proof Generation)
 
 ### Phase 1: GPU Integration (Sessions 1–5) — 50.5s → 31.6s
 
@@ -227,7 +250,7 @@ All remaining optimization ideas were evaluated and found not worth pursuing:
 
 ---
 
-## 5. Architectural Differences
+## 6. Architectural Differences (Prover)
 
 | Aspect | Original | Optimized |
 |--------|----------|-----------|
@@ -247,7 +270,7 @@ All remaining optimization ideas were evaluated and found not worth pursuing:
 
 ---
 
-## 6. Phase Breakdown at 0.8s
+## 7. Proof Generation Breakdown at 0.8s
 
 ```
 Total: ~0.80s
@@ -276,7 +299,7 @@ Total: ~0.80s
 
 ---
 
-## 7. Build Configuration
+## 8. Build Configuration
 
 ### Cargo Profile
 
@@ -313,7 +336,7 @@ SHARD_BATCH_SIZE=3 VERIFY_VK=false FRI_QUERIES=1 LOG_BLOWUP=4 METAL_DFT=1 \
 
 ---
 
-## 8. Soundness Considerations
+## 9. Soundness Considerations
 
 The aggressive FRI configuration used for benchmarking provides reduced cryptographic soundness:
 
@@ -330,16 +353,36 @@ The benchmark configuration is appropriate for development and performance testi
 
 ---
 
-## 9. Remaining Bottlenecks
+## 10. Production Readiness
 
-At 0.8s, costs are well-distributed across 10+ sub-phases with no single dominant bottleneck:
+The 0.8s headline number uses an aggressive benchmark config (`FRI_QUERIES=1`, ~4 bits of soundness). **This is not production-grade.** Production requires ~100+ bits of soundness.
+
+| Config | Soundness | Proof Gen Time | Use Case |
+|--------|-----------|---------------|----------|
+| `FRI_QUERIES=1, LOG_BLOWUP=4` | ~4 bits | **0.8s** | Dev / benchmarking only |
+| `FRI_QUERIES=33, LOG_BLOWUP=2` | ~66 bits | ~3-5s (est.) | Moderate security |
+| `FRI_QUERIES=100, LOG_BLOWUP=1` | ~100+ bits | ~8-15s (est.) | Production |
+
+At production config, the recursion circuit grows significantly (BatchFRI from 2^12 to 2^19), increasing compress time. However, all core optimizations — GPU acceleration, shape tuning, batching, LDE caching, batch inversion, backtrace removal, etc. — carry over fully. The estimated production improvement is **~4-6× over unmodified SP1**.
+
+For production throughput on a single M3 Pro:
+- **Proof generation:** ~8-15s per Fibonacci proof (production FRI config)
+- **Proof verification (off-chain):** ~1-10ms — trivially fast
+- **Proof verification (on-chain):** ~150K gas (Groth16) — standard for ZK on Ethereum
+- **Throughput scaling:** Proof generation parallelizes across machines; each prover instance is independent
+
+---
+
+## 11. Remaining Bottlenecks (Proof Generation)
+
+At 0.8s (benchmark config), proof generation costs are well-distributed across 10+ sub-phases with no single dominant bottleneck:
 
 - **Byte chip** (2^16 = 65,536 rows): Inherent to SP1's lookup architecture (256×256 table). Sets the minimum FRI height floor for all proofs.
 - **ExtAlu=15** (32,768 rows): Inherent to proof verification arithmetic in the recursion circuit. Sets the recursion circuit floor.
 - **pcs\_open** (158ms core + 88ms compress): Dominated by row reduction (compute-bound, not memory-bound) and FRI folding.
 - **quotient computation** (95ms core + 32ms compress): Constraint evaluation over the domain — already uses precomputed interactions.
 
-Further gains would require one or more of:
+Further proof generation gains would require one or more of:
 
 1. **Different proof system** — alternative to FRI with lower per-proof overhead
 2. **Different recursion strategy** — avoiding the recursive STARK-in-STARK approach
@@ -348,4 +391,4 @@ Further gains would require one or more of:
 
 ---
 
-*Report generated March 2026. All benchmarks on Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM) running macOS.*
+*Report generated March 2026. All timings are proof generation times unless stated otherwise. All benchmarks on Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM) running macOS.*
