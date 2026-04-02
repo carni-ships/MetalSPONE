@@ -854,19 +854,33 @@ where
             let round_opened_values: Vec<Vec<Vec<Challenge>>> = mats.par_iter()
                 .zip(points.par_iter())
                 .map(|(mat, points_for_mat)| {
-                    points_for_mat.iter().map(|&point| {
-                        let h = mat.height() >> log_blowup;
-                        let log_h = log2_strict_usize(h);
-                        let (low_coset, _) = mat.split_rows(h);
+                    let h = mat.height() >> log_blowup;
+                    let log_h = log2_strict_usize(h);
+                    let (low_coset, _) = mat.split_rows(h);
+                    let brp_view = BitReversalPerm::new_view(low_coset);
+
+                    let make_diff_invs = |point: Challenge| -> Vec<Challenge> {
                         let full_inv = inv_denoms.get(&point).unwrap();
-                        let diff_invs: Vec<Challenge> = (0..h)
-                            .map(|i| -full_inv[reverse_bits_len(i, log_h)])
-                            .collect();
-                        interpolate_coset_precomputed(
-                            &BitReversalPerm::new_view(low_coset),
-                            Val::generator(), point, &diff_invs,
-                        )
-                    }).collect_vec()
+                        (0..h).map(|i| -full_inv[reverse_bits_len(i, log_h)]).collect()
+                    };
+
+                    if points_for_mat.len() == 2 {
+                        let di0 = make_diff_invs(points_for_mat[0]);
+                        let di1 = make_diff_invs(points_for_mat[1]);
+                        let (ys0, ys1) = interpolate_coset_precomputed_2point(
+                            &brp_view, Val::generator(),
+                            points_for_mat[0], &di0,
+                            points_for_mat[1], &di1,
+                        );
+                        vec![ys0, ys1]
+                    } else {
+                        points_for_mat.iter().map(|&point| {
+                            let diff_invs = make_diff_invs(point);
+                            interpolate_coset_precomputed(
+                                &brp_view, Val::generator(), point, &diff_invs,
+                            )
+                        }).collect_vec()
+                    }
                 }).collect();
 
             for mat_values in &round_opened_values {
