@@ -972,9 +972,11 @@ where
 
     /// Like `open_sequential_cached` but the preprocessed round is passed as a read-only
     /// reference, avoiding a clone of the (potentially large) preprocessed prover data.
+    ///
+    /// During interpolation (Phase 1), only one round's LDE is in memory at a time,
+    /// reducing peak memory compared to loading all rounds simultaneously.
+    /// Produces the same proof as `open()`.
     #[allow(clippy::too_many_lines)]
-    /// Thin wrapper around the proven-correct `open` function.
-    /// Restores all saved LDEs, then delegates to `open`.
     pub fn open_sequential_cached_split<Challenge, Challenger>(
         &self,
         preprocessed_data: &<InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>,
@@ -1000,25 +1002,261 @@ where
             + FieldChallenger<Val>,
         <InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>: Clone + LeafManageable<Val>,
     {
-        // Restore all LDEs before delegating to the proven-correct `open` function.
-        for (ri, (data, _)) in rounds.iter_mut().enumerate() {
+        assert_eq!(rounds.len(), saved_ldes.len());
+
+        // Phase 0: Compute dimensions for inv_denoms without loading all LDEs.
+        let mut global_max_height: usize = 0;
+        let mut global_max_width: usize = 0;
+
+        // Preprocessed round dimensions (always available).
+        let prep_dims: Vec<Dimensions> = self.mmcs
+            .get_matrices(preprocessed_data)
+            .iter()
+            .map(|m| {
+                let d = m.dimensions();
+                global_max_height = global_max_height.max(d.height);
+                global_max_width = global_max_width.max(d.width);
+                d
+            })
+            .collect();
+
+        // Other rounds: temporarily restore LDEs to read dimensions, then take back.
+        let round_dims: Vec<Vec<Dimensions>> = rounds
+            .iter_mut()
+            .zip(saved_ldes.iter_mut())
+            .map(|((data, _), saved)| {
+                let needs_restore = saved.is_some();
+                if let Some(ldes) = saved.take() {
+                    data.restore_leaves_rm(ldes);
+                }
+                let dims: Vec<Dimensions> = self.mmcs
+                    .get_matrices(*data)
+                    .iter()
+                    .map(|m| {
+                        let d = m.dimensions();
+                        global_max_height = global_max_height.max(d.height);
+                        global_max_width = global_max_width.max(d.width);
+                        d
+                    })
+                    .collect();
+                if needs_restore {
+                    *saved = Some(data.take_leaves_rm());
+                }
+                dims
+            })
+            .collect();
+
+        let log_global_max_height = log2_strict_usize(global_max_height);
+
+        // Pre-compute inv_denoms from dimensions (no full matrices needed).
+        let mut all_dims_and_points: Vec<(Vec<Dimensions>, &Vec<Vec<Challenge>>)> =
+            Vec::with_capacity(1 + rounds.len());
+        all_dims_and_points.push((prep_dims, &preprocessed_points));
+        for (dims, (_, points)) in round_dims.iter().zip(rounds.iter()) {
+            all_dims_and_points.push((dims.clone(), points));
+        }
+        let inv_denoms = compute_inverse_denominators_from_dims(
+            &all_dims_and_points, self.fri.log_blowup, Val::generator(),
+        );
+
+        let log_blowup = self.fri.log_blowup;
+
+        // Interpolation helper: given matrices and points, compute opened values
+        // with 2-point fusion when possible.
+        macro_rules! interpolate_mats {
+            ($mats:expr, $points:expr) => {{
+                $mats.par_iter()
+                    .zip($points.par_iter())
+                    .map(|(mat, points_for_mat)| {
+                        let h = mat.height() >> log_blowup;
+                        let log_h = log2_strict_usize(h);
+                        let (low_coset, _) = mat.split_rows(h);
+                        let brp_view = BitReversalPerm::new_view(low_coset);
+                        let make_diff_invs = |point: Challenge| -> Vec<Challenge> {
+                            let full_inv = inv_denoms.get(&point).unwrap();
+                            (0..h).map(|i| -full_inv[reverse_bits_len(i, log_h)]).collect()
+                        };
+                        if points_for_mat.len() == 2 {
+                            let di0 = make_diff_invs(points_for_mat[0]);
+                            let di1 = make_diff_invs(points_for_mat[1]);
+                            let (ys0, ys1) = interpolate_coset_precomputed_2point(
+                                &brp_view, Val::generator(),
+                                points_for_mat[0], &di0,
+                                points_for_mat[1], &di1,
+                            );
+                            vec![ys0, ys1]
+                        } else {
+                            points_for_mat.iter().map(|&point| {
+                                let diff_invs = make_diff_invs(point);
+                                interpolate_coset_precomputed(
+                                    &brp_view, Val::generator(), point, &diff_invs,
+                                )
+                            }).collect_vec()
+                        }
+                    }).collect::<Vec<_>>()
+            }};
+        }
+
+        // Phase 1: Interpolation — one round's LDE in memory at a time.
+        let mut all_opened_values: OpenedValues<Challenge> = Vec::with_capacity(1 + rounds.len());
+
+        // 1a: Preprocessed round (always in memory).
+        {
+            let mats: Vec<_> = self.mmcs.get_matrices(preprocessed_data)
+                .into_iter().map(|m| m.as_view()).collect_vec();
+            let round_opened: Vec<Vec<Vec<Challenge>>> = interpolate_mats!(mats, preprocessed_points);
+            for mat_values in &round_opened {
+                for ys in mat_values {
+                    ys.iter().for_each(|&y| challenger.observe_ext_element(y));
+                }
+            }
+            all_opened_values.push(round_opened);
+        }
+
+        // 1b: Main/perm/quotient rounds — restore one at a time, interpolate, take back.
+        for (ri, (data, points)) in rounds.iter_mut().enumerate() {
+            let has_saved = saved_ldes[ri].is_some();
             if let Some(ldes) = saved_ldes[ri].take() {
                 data.restore_leaves_rm(ldes);
             }
+
+            let mats: Vec<_> = self.mmcs.get_matrices(*data)
+                .into_iter().map(|m| m.as_view()).collect_vec();
+            let round_opened: Vec<Vec<Vec<Challenge>>> = interpolate_mats!(mats, points);
+            for mat_values in &round_opened {
+                for ys in mat_values {
+                    ys.iter().for_each(|&y| challenger.observe_ext_element(y));
+                }
+            }
+            all_opened_values.push(round_opened);
+
+            // Take LDE back — only one round in memory at a time during interpolation.
+            if has_saved {
+                saved_ldes[ri] = Some(data.take_leaves_rm());
+            }
         }
 
-        // Build the rounds vec in the format `open` expects:
-        // [preprocessed, main, perm, quotient]
-        let mut open_rounds: Vec<(
-            &<InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>,
-            Vec<Vec<Challenge>>,
-        )> = Vec::with_capacity(1 + rounds.len());
-        open_rounds.push((preprocessed_data, preprocessed_points));
-        for (data, points) in rounds.iter() {
-            open_rounds.push((*data, points.clone()));
+        // Sample alpha AFTER all opened values are observed.
+        let alpha: Challenge = challenger.sample_ext_element();
+        let alpha_reducer = PowersReducer::<Val, Challenge>::new(alpha, global_max_width);
+
+        let mut num_reduced = [0usize; 32];
+        let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
+
+        // Phase 2: Row reduction with 2-point fusion.
+        macro_rules! reduce_mats {
+            ($mats:expr, $points:expr, $opened_values:expr) => {
+                for (mat, points_for_mat, openings_for_mat) in
+                    izip!($mats.iter(), $points.iter(), $opened_values.iter())
+                {
+                    let log_height = log2_strict_usize(mat.height());
+                    let reduced_opening_for_log_height = reduced_openings[log_height]
+                        .get_or_insert_with(|| vec![Challenge::zero(); mat.height()]);
+
+                    let row_sums: Vec<Challenge> = mat
+                        .par_row_slices()
+                        .map(|row| alpha_reducer.reduce_base(row))
+                        .collect();
+
+                    if points_for_mat.len() == 2 {
+                        let alpha_offset0 = alpha.exp_u64(num_reduced[log_height] as u64);
+                        let y0 = alpha_reducer.reduce_ext(&openings_for_mat[0]);
+                        let inv0 = inv_denoms.get(&points_for_mat[0]).unwrap();
+                        num_reduced[log_height] += mat.width();
+
+                        let alpha_offset1 = alpha.exp_u64(num_reduced[log_height] as u64);
+                        let y1 = alpha_reducer.reduce_ext(&openings_for_mat[1]);
+                        let inv1 = inv_denoms.get(&points_for_mat[1]).unwrap();
+                        num_reduced[log_height] += mat.width();
+
+                        reduced_opening_for_log_height
+                            .par_iter_mut()
+                            .zip(row_sums.par_iter())
+                            .zip(inv0[..mat.height()].par_iter())
+                            .zip(inv1[..mat.height()].par_iter())
+                            .for_each(|(((reduced, &row_sum), &d0), &d1)| {
+                                *reduced += (d0 * alpha_offset0) * (row_sum - y0)
+                                          + (d1 * alpha_offset1) * (row_sum - y1);
+                            });
+                    } else {
+                        for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
+                            let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
+                            let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
+                            let raw_inv_denoms = inv_denoms.get(&point).unwrap();
+
+                            reduced_opening_for_log_height
+                                .par_iter_mut()
+                                .zip(row_sums.par_iter())
+                                .zip(raw_inv_denoms[..mat.height()].par_iter())
+                                .for_each(|((reduced_opening, &row_sum), &inv_denom)| {
+                                    *reduced_opening +=
+                                        (inv_denom * alpha_pow_offset) * (row_sum - sum_alpha_pows_times_y);
+                                });
+
+                            num_reduced[log_height] += mat.width();
+                        }
+                    }
+                }
+            };
         }
 
-        self.open(open_rounds, challenger)
+        // 2a: Preprocessed round.
+        {
+            let mats: Vec<_> = self.mmcs.get_matrices(preprocessed_data)
+                .into_iter().map(|m| m.as_view()).collect_vec();
+            reduce_mats!(mats, preprocessed_points, all_opened_values[0]);
+        }
+
+        // 2b: Main/perm/quotient rounds — restore and keep loaded for query phase.
+        for (ri, (data, points)) in rounds.iter_mut().enumerate() {
+            if let Some(ldes) = saved_ldes[ri].take() {
+                data.restore_leaves_rm(ldes);
+            }
+
+            let mats: Vec<_> = self.mmcs.get_matrices(*data)
+                .into_iter().map(|m| m.as_view()).collect_vec();
+            reduce_mats!(mats, points, all_opened_values[ri + 1]);
+            // Keep LDEs loaded for query phase.
+        }
+
+        // FRI prove.
+        let (fri_proof, query_indices) =
+            prover::prove(&self.fri, &reduced_openings, challenger);
+
+        // Phase 3: Query openings — preprocessed first, then main/perm/quotient.
+        let num_queries = query_indices.len();
+        let num_all_rounds = 1 + rounds.len();
+        let mut all_query_openings: Vec<Vec<BatchOpening<Val, InputMmcs>>> =
+            (0..num_queries).map(|_| Vec::with_capacity(num_all_rounds)).collect();
+
+        // 3a: Preprocessed round.
+        {
+            let log_max_height = log2_strict_usize(self.mmcs.get_max_height(preprocessed_data));
+            let bits_reduced = log_global_max_height - log_max_height;
+            for (qi, &index) in query_indices.iter().enumerate() {
+                let reduced_index = index >> bits_reduced;
+                let (opened_values, opening_proof) =
+                    self.mmcs.open_batch(reduced_index, preprocessed_data);
+                all_query_openings[qi].push(BatchOpening { opened_values, opening_proof });
+            }
+        }
+
+        // 3b: Main/perm/quotient round queries.
+        for (data, _) in rounds.iter_mut() {
+            let log_max_height = log2_strict_usize(self.mmcs.get_max_height(*data));
+            let bits_reduced = log_global_max_height - log_max_height;
+            for (qi, &index) in query_indices.iter().enumerate() {
+                let reduced_index = index >> bits_reduced;
+                let (opened_values, opening_proof) =
+                    self.mmcs.open_batch(reduced_index, *data);
+                all_query_openings[qi].push(BatchOpening { opened_values, opening_proof });
+            }
+        }
+
+        (
+            all_opened_values,
+            TwoAdicFriPcsProof { fri_proof, query_openings: all_query_openings },
+        )
     }
 }
 
