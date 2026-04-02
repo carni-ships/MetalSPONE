@@ -360,30 +360,82 @@ where
                 structure.push(round_structure);
             }
 
-            // Run all interpolations in parallel, deriving diff_invs from precomputed inv_denoms.
+            // Run all interpolations in parallel with 2-point fusion when possible.
             // inv_denoms[point][j] = 1/(x_{bitrev(j)} - z) for full coset in bitrev order.
-            // First h entries correspond to low coset. For interpolation we need:
-            //   diff_inv[i] = 1/(z - x_i) = -inv_denoms[bitrev(i, log_h)]
-            let results: Vec<Vec<Challenge>> = jobs
+            // For interpolation we need: diff_inv[i] = 1/(z - x_i) = -inv_denoms[bitrev(i, log_h)]
+            //
+            // Group by matrix: matrices with exactly 2 points (the common case in SP1)
+            // use a fused kernel that reads the matrix once for both points.
+
+            // Collect per-matrix job groups: (mat_idx, [points])
+            let mut mat_jobs: Vec<(usize, Vec<Challenge>)> = Vec::new();
+            let mut job_to_mat: Vec<usize> = Vec::new(); // maps flat job index → mat_jobs index
+            {
+                let mut flat_idx = 0;
+                for (mats, points) in mats_and_points.iter() {
+                    for (_, points_for_mat) in izip!(mats.iter(), points.iter()) {
+                        let mj_idx = mat_jobs.len();
+                        mat_jobs.push((flat_idx, points_for_mat.clone()));
+                        for _ in points_for_mat.iter() {
+                            job_to_mat.push(mj_idx);
+                        }
+                        flat_idx += 1;
+                    }
+                }
+            }
+
+            // Run per-matrix interpolations in parallel.
+            let mat_results: Vec<Vec<Vec<Challenge>>> = mat_jobs
                 .par_iter()
-                .map(|&(mat_idx, point)| {
-                    let mat = all_mats[mat_idx];
+                .map(|(mat_idx, points)| {
+                    let mat = all_mats[*mat_idx];
                     let h = mat.height() >> log_blowup;
                     let log_h = log2_strict_usize(h);
                     let (low_coset, _) = mat.split_rows(h);
-                    // Derive diff_invs from precomputed inv_denoms by negating + bit-reversing.
-                    let full_inv = inv_denoms.get(&point).unwrap();
-                    let diff_invs: Vec<Challenge> = (0..h)
-                        .map(|i| -full_inv[reverse_bits_len(i, log_h)])
-                        .collect();
-                    interpolate_coset_precomputed(
-                        &BitReversalPerm::new_view(low_coset),
-                        Val::generator(),
-                        point,
-                        &diff_invs,
-                    )
+                    let brp_view = BitReversalPerm::new_view(low_coset);
+
+                    let make_diff_invs = |point: Challenge| -> Vec<Challenge> {
+                        let full_inv = inv_denoms.get(&point).unwrap();
+                        (0..h).map(|i| -full_inv[reverse_bits_len(i, log_h)]).collect()
+                    };
+
+                    if points.len() == 2 {
+                        // Fused 2-point: read matrix once for both opening points.
+                        let diff_invs0 = make_diff_invs(points[0]);
+                        let diff_invs1 = make_diff_invs(points[1]);
+                        let (ys0, ys1) = interpolate_coset_precomputed_2point(
+                            &brp_view,
+                            Val::generator(),
+                            points[0], &diff_invs0,
+                            points[1], &diff_invs1,
+                        );
+                        vec![ys0, ys1]
+                    } else {
+                        // General path for 1 or 3+ points.
+                        points.iter().map(|&point| {
+                            let diff_invs = make_diff_invs(point);
+                            interpolate_coset_precomputed(
+                                &brp_view,
+                                Val::generator(),
+                                point,
+                                &diff_invs,
+                            )
+                        }).collect()
+                    }
                 })
                 .collect();
+
+            // Flatten results in original job order.
+            let results: Vec<Vec<Challenge>> = {
+                let mut flat = Vec::with_capacity(jobs.len());
+                let mut point_offsets: Vec<usize> = vec![0; mat_jobs.len()];
+                for &mj_idx in &job_to_mat {
+                    let off = point_offsets[mj_idx];
+                    flat.push(mat_results[mj_idx][off].clone());
+                    point_offsets[mj_idx] += 1;
+                }
+                flat
+            };
 
             // Reconstruct nested structure and observe in order.
             let mut result_iter = results.into_iter();
@@ -1179,6 +1231,74 @@ where
     let zerofier = p3_field::two_adic_coset_zerofier::<EF>(log_height, EF::from_base(shift), point);
     let denominator = F::from_canonical_usize(height) * shift.exp_u64(height as u64 - 1);
     scale_vec(zerofier * denominator.inverse(), sum)
+}
+
+/// Two-point fused interpolation: reads the matrix once for both opening points.
+/// Returns (ys_for_point0, ys_for_point1).
+fn interpolate_coset_precomputed_2point<F, EF, Mat>(
+    coset_evals: &Mat,
+    shift: F,
+    point0: EF,
+    diff_invs0: &[EF],
+    point1: EF,
+    diff_invs1: &[EF],
+) -> (Vec<EF>, Vec<EF>)
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Mat: Matrix<F> + Sync,
+{
+    let height = coset_evals.height();
+    let width = coset_evals.width();
+    let log_height = log2_strict_usize(height);
+    let g = F::two_adic_generator(log_height);
+
+    // Precompute col_scale for both points.
+    let col_scale0: Vec<_> = g
+        .powers()
+        .zip(diff_invs0)
+        .map(|(sg, &diff_inv)| diff_inv * sg)
+        .collect();
+    let col_scale1: Vec<_> = g
+        .powers()
+        .zip(diff_invs1)
+        .map(|(sg, &diff_inv)| diff_inv * sg)
+        .collect();
+
+    // Fused columnwise dot product: read each row once, accumulate for both points.
+    use p3_maybe_rayon::prelude::*;
+    let (sum0, sum1) = coset_evals
+        .par_rows()
+        .zip(col_scale0.par_iter())
+        .zip(col_scale1.par_iter())
+        .par_fold_reduce(
+            || (vec![EF::zero(); width], vec![EF::zero(); width]),
+            |(mut acc0, mut acc1), ((row, &s0), &s1)| {
+                for (j, x) in row.into_iter().enumerate() {
+                    acc0[j] += s0 * x;
+                    acc1[j] += s1 * x;
+                }
+                (acc0, acc1)
+            },
+            |(mut a0, mut a1), (b0, b1)| {
+                for (l, r) in a0.iter_mut().zip(b0) {
+                    *l += r;
+                }
+                for (l, r) in a1.iter_mut().zip(b1) {
+                    *l += r;
+                }
+                (a0, a1)
+            },
+        );
+
+    let z0 = p3_field::two_adic_coset_zerofier::<EF>(log_height, EF::from_base(shift), point0);
+    let z1 = p3_field::two_adic_coset_zerofier::<EF>(log_height, EF::from_base(shift), point1);
+    let denominator = F::from_canonical_usize(height) * shift.exp_u64(height as u64 - 1);
+    let denom_inv = denominator.inverse();
+    let scale0 = z0 * denom_inv;
+    let scale1 = z1 * denom_inv;
+
+    (scale_vec(scale0, sum0), scale_vec(scale1, sum1))
 }
 
 #[cfg(test)]
