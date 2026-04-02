@@ -26,13 +26,20 @@ use crate::{
     ProverConstraintFolder, ShardCommitment, ShardMainData, ShardProof, StarkVerifyingKey,
 };
 
-/// Check if GPU constraint evaluation is enabled via METAL_CONSTRAINTS=1.
+/// Check if GPU constraint evaluation is enabled.
+/// Enabled when METAL_CONSTRAINTS=1 or when METAL_DFT=1 (auto-enable with GPU DFT).
+/// Disable explicitly with METAL_CONSTRAINTS=0.
 #[cfg(target_os = "macos")]
 fn gpu_constraints_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("METAL_CONSTRAINTS").ok().map_or(false, |v| v == "1")
+        // Explicit METAL_CONSTRAINTS takes priority
+        if let Ok(v) = std::env::var("METAL_CONSTRAINTS") {
+            return v == "1";
+        }
+        // Auto-enable when METAL_DFT=1 (GPU acceleration already active)
+        std::env::var("METAL_DFT").ok().map_or(false, |v| v == "1")
     })
 }
 

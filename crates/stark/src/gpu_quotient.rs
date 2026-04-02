@@ -96,9 +96,14 @@ where
         public_values,
     );
 
+    let tier = if program.num_regs <= 256 { 256 }
+        else if program.num_regs <= 512 { 512 }
+        else if program.num_regs <= 1024 { 1024 }
+        else if program.num_regs <= 2048 { 2048 }
+        else { 4096 };
     tracing::debug!(
-        "GPU constraint compile: quotient_size={} num_regs={} num_instr={}",
-        quotient_size, program.num_regs, program.num_instructions()
+        "GPU constraint compile: quotient_size={} num_regs={} tier={} num_instr={}",
+        quotient_size, program.num_regs, tier, program.num_instructions()
     );
 
     if program.num_regs > 4096 {
