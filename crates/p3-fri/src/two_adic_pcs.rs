@@ -902,7 +902,7 @@ where
         let mut num_reduced = [0usize; 32];
         let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
 
-        // Phase 2: Row reduction — restore cached LDEs, reduce, keep loaded for query phase.
+        // Phase 2: Row reduction with 2-point fusion — restore cached LDEs, reduce, keep loaded for query phase.
         for (ri, (data, points)) in rounds.iter_mut().enumerate() {
             if let Some(ldes) = saved_ldes[ri].take() {
                 data.restore_leaves_rm(ldes);
@@ -918,26 +918,49 @@ where
                 let reduced_opening_for_log_height = reduced_openings[log_height]
                     .get_or_insert_with(|| vec![Challenge::zero(); mat.height()]);
 
-                for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
-                    let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-                    let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
+                // Precompute reduce_base(row) once per row.
+                let row_sums: Vec<Challenge> = mat
+                    .par_row_slices()
+                    .map(|row| alpha_reducer.reduce_base(row))
+                    .collect();
 
-                    let raw_inv_denoms = inv_denoms.get(&point).unwrap();
-                    let scaled_inv_denoms: Vec<Challenge> = raw_inv_denoms[..mat.height()]
-                        .par_iter()
-                        .map(|&inv_denom| inv_denom * alpha_pow_offset)
-                        .collect();
+                if points_for_mat.len() == 2 {
+                    let alpha_offset0 = alpha.exp_u64(num_reduced[log_height] as u64);
+                    let y0 = alpha_reducer.reduce_ext(&openings_for_mat[0]);
+                    let inv0 = inv_denoms.get(&points_for_mat[0]).unwrap();
+                    num_reduced[log_height] += mat.width();
+
+                    let alpha_offset1 = alpha.exp_u64(num_reduced[log_height] as u64);
+                    let y1 = alpha_reducer.reduce_ext(&openings_for_mat[1]);
+                    let inv1 = inv_denoms.get(&points_for_mat[1]).unwrap();
+                    num_reduced[log_height] += mat.width();
 
                     reduced_opening_for_log_height
                         .par_iter_mut()
-                        .zip_eq(mat.par_row_slices())
-                        .zip(scaled_inv_denoms.par_iter())
-                        .for_each(|((reduced_opening, row), &scaled_inv)| {
-                            let row_sum = alpha_reducer.reduce_base(row);
-                            *reduced_opening += scaled_inv * (row_sum - sum_alpha_pows_times_y);
+                        .zip(row_sums.par_iter())
+                        .zip(inv0[..mat.height()].par_iter())
+                        .zip(inv1[..mat.height()].par_iter())
+                        .for_each(|(((reduced, &row_sum), &d0), &d1)| {
+                            *reduced += (d0 * alpha_offset0) * (row_sum - y0)
+                                      + (d1 * alpha_offset1) * (row_sum - y1);
                         });
+                } else {
+                    for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
+                        let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
+                        let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
+                        let raw_inv_denoms = inv_denoms.get(&point).unwrap();
 
-                    num_reduced[log_height] += mat.width();
+                        reduced_opening_for_log_height
+                            .par_iter_mut()
+                            .zip(row_sums.par_iter())
+                            .zip(raw_inv_denoms[..mat.height()].par_iter())
+                            .for_each(|((reduced_opening, &row_sum), &inv_denom)| {
+                                *reduced_opening +=
+                                    (inv_denom * alpha_pow_offset) * (row_sum - sum_alpha_pows_times_y);
+                            });
+
+                        num_reduced[log_height] += mat.width();
+                    }
                 }
             }
             // Keep LDEs loaded for query phase
