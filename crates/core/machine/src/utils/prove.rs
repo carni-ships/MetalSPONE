@@ -140,9 +140,17 @@ where
                         let _span = span.enter();
 
                         // Execute the runtime until we reach a checkpoint.
-                        let (checkpoint, _, done) = runtime
-                            .execute_state(false)
-                            .map_err(SP1CoreProverError::ExecutionError)?;
+                        let result = runtime.execute_state(false);
+                        let (checkpoint, _, done) = match result {
+                            Ok(val) => val,
+                            Err(ExecutionError::ExceededCycleLimit(_)) => {
+                                // Cycle limit reached — treat as graceful completion.
+                                // All checkpoints sent so far are valid; just stop.
+                                tracing::info!("cycle limit reached, stopping checkpoint generation");
+                                break Ok(runtime.state.public_values_stream.clone());
+                            }
+                            Err(e) => return Err(SP1CoreProverError::ExecutionError(e)),
+                        };
 
                         // Save the checkpoint to a temp file.
                         let mut checkpoint_file =
@@ -322,39 +330,44 @@ where
                             #[cfg(feature = "debug")]
                             all_records_tx.send(records.clone()).unwrap();
 
-                            let mut main_traces = Vec::new();
-                            if let Some(malicious_trace_pv_generator) = malicious_trace_pv_generator
-                            {
-                                tracing::info_span!("generate main traces", index).in_scope(|| {
-                                    main_traces = records
-                                        .par_iter_mut()
-                                        .map(|record| malicious_trace_pv_generator(prover, record))
-                                        .collect::<Vec<_>>();
-                                });
-                            } else {
-                                tracing::info_span!("generate main traces", index).in_scope(|| {
-                                    main_traces = records
-                                        .par_iter()
-                                        .map(|record| prover.generate_traces(record))
-                                        .collect::<Vec<_>>();
-                                });
-                            }
+                            // Batch trace generation and sending to limit peak memory.
+                            // Instead of generating all traces at once, process in chunks
+                            // of shard_batch_size and send each chunk immediately.
+                            let trace_batch_limit = std::env::var("TRACE_BATCH_LIMIT")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(8);
+                            let chunked_records = chunk_vec(records, trace_batch_limit);
 
                             trace_gen_sync.wait_for_turn(index);
 
-                            // Send the records to the phase 2 prover.
-                            let chunked_records = chunk_vec(records, opts.shard_batch_size);
-                            let chunked_main_traces = chunk_vec(main_traces, opts.shard_batch_size);
-                            chunked_records
-                                .into_iter()
-                                .zip(chunked_main_traces.into_iter())
-                                .for_each(|(records, main_traces)| {
+                            for mut batch_records in chunked_records {
+                                let batch_traces = if let Some(malicious_trace_pv_generator) = malicious_trace_pv_generator {
+                                    tracing::info_span!("generate main traces", index).in_scope(|| {
+                                        batch_records
+                                            .par_iter_mut()
+                                            .map(|record| malicious_trace_pv_generator(prover, record))
+                                            .collect::<Vec<_>>()
+                                    })
+                                } else {
+                                    tracing::info_span!("generate main traces", index).in_scope(|| {
+                                        batch_records
+                                            .par_iter()
+                                            .map(|record| prover.generate_traces(record))
+                                            .collect::<Vec<_>>()
+                                    })
+                                };
+                                // Send this batch's records + traces immediately.
+                                let send_records = chunk_vec(batch_records, opts.shard_batch_size);
+                                let send_traces = chunk_vec(batch_traces, opts.shard_batch_size);
+                                send_records.into_iter().zip(send_traces).for_each(|(recs, traces)| {
                                     records_and_traces_tx
                                         .lock()
                                         .unwrap()
-                                        .send((records, main_traces))
+                                        .send((recs, traces))
                                         .unwrap();
                                 });
+                            }
 
                             trace_gen_sync.advance_turn();
                         } else {

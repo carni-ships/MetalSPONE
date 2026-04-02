@@ -23,49 +23,29 @@ use tracing::{info_span, instrument};
 
 use p3_merkle_tree::LeafManageable;
 
-// GPU dot product was tested but 12 CPU cores outperform sequential GPU dispatch.
-// Kept as reference in metal-ntt/src/dot_product.rs and metal-ntt/shaders/dot_product.metal.
-#[cfg(any())]
-mod _gpu_interp_unused {
-    use p3_baby_bear::BabyBear;
+// GPU interpolation for PCS open. Re-enabled for <=8 core machines where GPU wins.
+#[cfg(target_os = "macos")]
+mod gpu_interp {
+    use alloc::vec::Vec;
     use p3_field::{
-        batch_multiplicative_inverse, cyclic_subgroup_coset_known_order, scale_vec,
+        batch_multiplicative_inverse, cyclic_subgroup_coset_known_order,
         two_adic_coset_zerofier, AbstractField, ExtensionField, Field, TwoAdicField,
     };
-    use p3_field::extension::BinomialExtensionField;
-    use p3_matrix::dense::RowMajorMatrixView;
-    use p3_util::log2_strict_usize;
-
-    use std::sync::{Mutex, OnceLock};
-
-    type F = BabyBear;
-    type EF = BinomialExtensionField<F, 4>;
+    use p3_util::{log2_strict_usize, reverse_slice_index_bits};
 
     fn gpu_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("METAL_DFT").ok().map_or(false, |v| v == "1")
-        })
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static ENABLED: AtomicU8 = AtomicU8::new(2); // 2 = uninitialized
+        let v = ENABLED.load(Ordering::Relaxed);
+        if v != 2 { return v == 1; }
+        let enabled = std::env::var("METAL_DFT").ok().map_or(false, |v| v == "1");
+        ENABLED.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
+        enabled
     }
 
-    fn global_metal() -> &'static metal_ntt::device::MetalState {
-        static STATE: OnceLock<metal_ntt::device::MetalState> = OnceLock::new();
-        STATE.get_or_init(|| metal_ntt::device::MetalState::new())
-    }
-
-    /// Check if GPU interpolation is possible for the given types.
-    pub fn can_use_gpu<F2, EF2>() -> bool
-    where
-        F2: TwoAdicField,
-        EF2: ExtensionField<F2> + TwoAdicField,
-    {
-        std::mem::size_of::<F2>() == 4
-            && std::mem::size_of::<EF2>() == 16
-            && gpu_enabled()
-    }
-
-    /// GPU-accelerated interpolation. Returns None if types don't match.
-    pub fn try_gpu_interpolate_coset<F2, EF2>(
+    /// GPU interpolation for data stored in bit-reversed row order (LDE layout).
+    /// Bit-reverses the weights to match the bit-reversed data storage.
+    pub fn try_gpu_interpolate_coset_bitrev<F2, EF2>(
         mat_data: &[F2],
         height: usize,
         width: usize,
@@ -76,38 +56,46 @@ mod _gpu_interp_unused {
         F2: TwoAdicField,
         EF2: ExtensionField<F2> + TwoAdicField,
     {
-        // Only works for BabyBear with degree-4 extension
-        if std::mem::size_of::<F2>() != 4 || std::mem::size_of::<EF2>() != 16 {
+        if core::mem::size_of::<F2>() != 4 || core::mem::size_of::<EF2>() != 16 {
             return None;
         }
         if !gpu_enabled() {
             return None;
         }
-        // Minimum size for GPU to be worthwhile
+        // Disabled: most PCS interpolation matrices are narrow (1-14 cols).
+        // GPU dispatch overhead per matrix exceeds benefit for narrow matrices.
+        // Would need batched dispatch across all matrices to amortize overhead.
+        return None;
+        #[allow(unreachable_code)]
         if height * width < 262144 {
             return None;
         }
-        let state = global_metal();
+
+        use std::sync::OnceLock;
+        static STATE: OnceLock<metal_ntt::device::MetalState> = OnceLock::new();
+        let state = STATE.get_or_init(metal_ntt::device::MetalState::new);
         let log_h = log2_strict_usize(height);
 
-        // Compute col_scale on CPU (small: H elements)
         let g = F2::two_adic_generator(log_h);
         let diffs: Vec<EF2> = cyclic_subgroup_coset_known_order(g, shift, height)
             .map(|subgroup_i| point - subgroup_i)
             .collect();
         let diff_invs = batch_multiplicative_inverse(&diffs);
-        let col_scale: Vec<EF2> = g
+        let mut col_scale: Vec<EF2> = g
             .powers()
             .zip(diff_invs)
             .map(|(sg, diff_inv)| diff_inv * sg)
             .collect();
 
-        // Transmute to u32 slices for GPU (BabyBear is repr(transparent) over u32)
+        // NOTE: The Metal shader already does bit-reversal on the row index
+        // when reading col_scale (line: brp_row = reverse_bits(row) >> ...),
+        // so col_scale must be passed in NATURAL order — no reversal here.
+
         let mat_u32: &[u32] = unsafe {
-            std::slice::from_raw_parts(mat_data.as_ptr() as *const u32, mat_data.len())
+            core::slice::from_raw_parts(mat_data.as_ptr() as *const u32, mat_data.len())
         };
         let col_scale_u32: &[u32] = unsafe {
-            std::slice::from_raw_parts(col_scale.as_ptr() as *const u32, col_scale.len() * 4)
+            core::slice::from_raw_parts(col_scale.as_ptr() as *const u32, col_scale.len() * 4)
         };
 
         let result_u32 = metal_ntt::dot_product::gpu_columnwise_dot_product(
@@ -118,14 +106,12 @@ mod _gpu_interp_unused {
             width,
         );
 
-        // Apply zerofier scaling
         let zerofier = two_adic_coset_zerofier::<EF2>(log_h, EF2::from_base(shift), point);
         let denominator = F2::from_canonical_usize(height) * shift.exp_u64(height as u64 - 1);
         let zerofier_scale = zerofier * denominator.inverse();
 
-        // Convert result back
         let mut result: Vec<EF2> = unsafe {
-            let mut v = std::mem::ManuallyDrop::new(result_u32);
+            let mut v = core::mem::ManuallyDrop::new(result_u32);
             Vec::from_raw_parts(
                 v.as_mut_ptr() as *mut EF2,
                 width,
@@ -242,13 +228,21 @@ where
             .collect();
 
         // Batch DFT: implementations may process all matrices on GPU in one lock acquisition
+        let t_dft = std::time::Instant::now();
         let ldes: Vec<_> = self.dft
             .coset_lde_batch_multi(inputs)
             .into_iter()
             .map(|m| m.bit_reverse_rows().to_row_major_matrix())
             .collect();
+        let dft_ms = t_dft.elapsed().as_secs_f64() * 1000.0;
 
-        self.mmcs.commit(ldes)
+        let t_merkle = std::time::Instant::now();
+        let result = self.mmcs.commit(ldes);
+        let merkle_ms = t_merkle.elapsed().as_secs_f64() * 1000.0;
+        if dft_ms + merkle_ms > 100.0 {
+            tracing::info!("commit breakdown: dft={dft_ms:.0}ms merkle={merkle_ms:.0}ms total={:.0}ms", dft_ms + merkle_ms);
+        }
+        result
     }
 
     fn get_evaluations_on_domain<'a>(
@@ -432,25 +426,27 @@ where
                     .get_or_insert_with(|| vec![Challenge::zero(); mat.height()]);
                 debug_assert_eq!(reduced_opening_for_log_height.len(), mat.height());
 
+                // Precompute reduce_base(row) once per row — reused across all
+                // opening points for this matrix, saving one full O(height×width)
+                // pass per extra point (SP1 always opens at 2 points).
+                let row_sums: Vec<Challenge> = mat
+                    .par_row_slices()
+                    .map(|row| alpha_reducer.reduce_base(row))
+                    .collect();
+
                 for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
                     let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
                     let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
 
-                    // Precompute scaled inverse denominators to save one extension multiply per row.
                     let raw_inv_denoms = inv_denoms.get(&point).unwrap();
-                    let scaled_inv_denoms: Vec<Challenge> = raw_inv_denoms[..mat.height()]
-                        .par_iter()
-                        .map(|&inv_denom| inv_denom * alpha_pow_offset)
-                        .collect();
 
                     reduced_opening_for_log_height
                         .par_iter_mut()
-                        .zip_eq(mat.par_row_slices())
-                        .zip(scaled_inv_denoms.par_iter())
-                        .for_each(|((reduced_opening, row), &scaled_inv)| {
-                            let row_sum = alpha_reducer.reduce_base(row);
+                        .zip(row_sums.par_iter())
+                        .zip(raw_inv_denoms[..mat.height()].par_iter())
+                        .for_each(|((reduced_opening, &row_sum), &inv_denom)| {
                             *reduced_opening +=
-                                scaled_inv * (row_sum - sum_alpha_pows_times_y);
+                                (inv_denom * alpha_pow_offset) * (row_sum - sum_alpha_pows_times_y);
                         });
 
                     num_reduced[log_height] += mat.width();
@@ -885,6 +881,8 @@ where
     /// Like `open_sequential_cached` but the preprocessed round is passed as a read-only
     /// reference, avoiding a clone of the (potentially large) preprocessed prover data.
     #[allow(clippy::too_many_lines)]
+    /// Thin wrapper around the proven-correct `open` function.
+    /// Restores all saved LDEs, then delegates to `open`.
     pub fn open_sequential_cached_split<Challenge, Challenger>(
         &self,
         preprocessed_data: &<InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>,
@@ -901,265 +899,34 @@ where
     )
     where
         Challenge: TwoAdicField + ExtensionField<Val>,
-        FriMmcs: Mmcs<Challenge>,
+        Dft: Sync,
+        InputMmcs: Sync,
+        FriMmcs: Mmcs<Challenge> + Sync,
         Challenger: CanObserve<FriMmcs::Commitment>
             + CanSample<Challenge>
             + GrindingChallenger<Witness = Val>
             + FieldChallenger<Val>,
         <InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>: Clone + LeafManageable<Val>,
     {
-        assert_eq!(rounds.len(), saved_ldes.len());
-
-        // Phase 0: Compute dimensions from preprocessed (read-only) + mutable rounds.
-        let mut global_max_height: usize = 0;
-        let mut global_max_width: usize = 0;
-
-        // Preprocessed round dimensions (read-only, no restore needed).
-        let prep_dims: Vec<Dimensions> = self.mmcs
-            .get_matrices(preprocessed_data)
-            .iter()
-            .map(|m| {
-                let d = m.dimensions();
-                global_max_height = global_max_height.max(d.height);
-                global_max_width = global_max_width.max(d.width);
-                d
-            })
-            .collect();
-
-        // Mutable rounds: restore LDEs to read dimensions, take back.
-        let mut round_dims: Vec<Vec<Dimensions>> = rounds
-            .iter_mut()
-            .zip(saved_ldes.iter_mut())
-            .map(|((data, _), saved)| {
-                let needs_restore = saved.is_some();
-                if let Some(ldes) = saved.take() {
-                    data.restore_leaves_rm(ldes);
-                }
-                let dims: Vec<Dimensions> = self.mmcs
-                    .get_matrices(*data)
-                    .iter()
-                    .map(|m| {
-                        let d = m.dimensions();
-                        global_max_height = global_max_height.max(d.height);
-                        global_max_width = global_max_width.max(d.width);
-                        d
-                    })
-                    .collect();
-                if needs_restore {
-                    *saved = Some(data.take_leaves_rm());
-                }
-                dims
-            })
-            .collect();
-
-        // Insert preprocessed dims at front for inv_denoms computation.
-        round_dims.insert(0, prep_dims);
-
-        let log_global_max_height = log2_strict_usize(global_max_height);
-
-        // Build combined dims+points for inv_denoms.
-        let all_dims_and_points: Vec<(Vec<Dimensions>, &Vec<Vec<Challenge>>)> = {
-            let mut v = Vec::with_capacity(1 + rounds.len());
-            v.push((round_dims[0].clone(), &preprocessed_points));
-            for (i, (_, points)) in rounds.iter().enumerate() {
-                v.push((round_dims[i + 1].clone(), points));
-            }
-            v
-        };
-        let inv_denoms = compute_inverse_denominators_from_dims(&all_dims_and_points, self.fri.log_blowup, Val::generator());
-
-        let mut all_opened_values: OpenedValues<Challenge> = Vec::new();
-        let log_blowup = self.fri.log_blowup;
-        // Phase 1: Interpolation.
-        // Preprocessed round (read-only).
-        {
-            let mats: Vec<_> = self.mmcs.get_matrices(preprocessed_data)
-                .into_iter().map(|m| m.as_view()).collect_vec();
-
-            let round_opened_values: Vec<Vec<Vec<Challenge>>> = mats.par_iter()
-                .zip(preprocessed_points.par_iter())
-                .map(|(mat, points_for_mat)| {
-                    points_for_mat.iter().map(|&point| {
-                        let h = mat.height() >> log_blowup;
-                        let log_h = log2_strict_usize(h);
-                        let (low_coset, _) = mat.split_rows(h);
-                        let full_inv = inv_denoms.get(&point).unwrap();
-                        let diff_invs: Vec<Challenge> = (0..h)
-                            .map(|i| -full_inv[reverse_bits_len(i, log_h)])
-                            .collect();
-                        interpolate_coset_precomputed(
-                            &BitReversalPerm::new_view(low_coset),
-                            Val::generator(), point, &diff_invs,
-                        )
-                    }).collect_vec()
-                }).collect();
-
-            for mat_values in &round_opened_values {
-                for ys in mat_values {
-                    ys.iter().for_each(|&y| challenger.observe_ext_element(y));
-                }
-            }
-            all_opened_values.push(round_opened_values);
-        }
-
-        // Mutable rounds.
-        for (ri, (data, points)) in rounds.iter_mut().enumerate() {
-            let has_saved = saved_ldes[ri].is_some();
+        // Restore all LDEs before delegating to the proven-correct `open` function.
+        for (ri, (data, _)) in rounds.iter_mut().enumerate() {
             if let Some(ldes) = saved_ldes[ri].take() {
                 data.restore_leaves_rm(ldes);
             }
-
-            let mats: Vec<_> = self.mmcs.get_matrices(*data)
-                .into_iter().map(|m| m.as_view()).collect_vec();
-
-            let round_opened_values: Vec<Vec<Vec<Challenge>>> = mats.par_iter()
-                .zip(points.par_iter())
-                .map(|(mat, points_for_mat)| {
-                    points_for_mat.iter().map(|&point| {
-                        let h = mat.height() >> log_blowup;
-                        let log_h = log2_strict_usize(h);
-                        let (low_coset, _) = mat.split_rows(h);
-                        let full_inv = inv_denoms.get(&point).unwrap();
-                        let diff_invs: Vec<Challenge> = (0..h)
-                            .map(|i| -full_inv[reverse_bits_len(i, log_h)])
-                            .collect();
-                        interpolate_coset_precomputed(
-                            &BitReversalPerm::new_view(low_coset),
-                            Val::generator(), point, &diff_invs,
-                        )
-                    }).collect_vec()
-                }).collect();
-
-            for mat_values in &round_opened_values {
-                for ys in mat_values {
-                    ys.iter().for_each(|&y| challenger.observe_ext_element(y));
-                }
-            }
-            all_opened_values.push(round_opened_values);
-
-            if has_saved {
-                saved_ldes[ri] = Some(data.take_leaves_rm());
-            }
-        }
-        // Sample alpha AFTER all opened values are observed
-        let alpha: Challenge = challenger.sample_ext_element();
-        let alpha_reducer = PowersReducer::<Val, Challenge>::new(alpha, global_max_width);
-        let mut num_reduced = [0usize; 32];
-        let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
-
-        // Phase 2: Row reduction.
-        // Preprocessed round (read-only).
-        {
-            let mats: Vec<_> = self.mmcs.get_matrices(preprocessed_data)
-                .into_iter().map(|m| m.as_view()).collect_vec();
-
-            for (mat, points_for_mat, openings_for_mat) in
-                izip!(mats.iter(), preprocessed_points.iter(), all_opened_values[0].iter())
-            {
-                let log_height = log2_strict_usize(mat.height());
-                let reduced_opening_for_log_height = reduced_openings[log_height]
-                    .get_or_insert_with(|| vec![Challenge::zero(); mat.height()]);
-
-                for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
-                    let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-                    let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
-
-                    let raw_inv_denoms = inv_denoms.get(&point).unwrap();
-                    let scaled_inv_denoms: alloc::vec::Vec<Challenge> = raw_inv_denoms[..mat.height()]
-                        .par_iter()
-                        .map(|&inv_denom| inv_denom * alpha_pow_offset)
-                        .collect();
-
-                    reduced_opening_for_log_height
-                        .par_iter_mut()
-                        .zip_eq(mat.par_row_slices())
-                        .zip(scaled_inv_denoms.par_iter())
-                        .for_each(|((reduced_opening, row), &scaled_inv)| {
-                            let row_sum = alpha_reducer.reduce_base(row);
-                            *reduced_opening += scaled_inv * (row_sum - sum_alpha_pows_times_y);
-                        });
-
-                    num_reduced[log_height] += mat.width();
-                }
-            }
         }
 
-        // Mutable rounds: restore cached LDEs, reduce, keep loaded for query phase.
-        for (ri, (data, points)) in rounds.iter_mut().enumerate() {
-            if let Some(ldes) = saved_ldes[ri].take() {
-                data.restore_leaves_rm(ldes);
-            }
-
-            let mats: Vec<_> = self.mmcs.get_matrices(*data)
-                .into_iter().map(|m| m.as_view()).collect_vec();
-
-            for (mat, points_for_mat, openings_for_mat) in
-                izip!(mats.iter(), points.iter(), all_opened_values[ri + 1].iter())
-            {
-                let log_height = log2_strict_usize(mat.height());
-                let reduced_opening_for_log_height = reduced_openings[log_height]
-                    .get_or_insert_with(|| vec![Challenge::zero(); mat.height()]);
-
-                for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
-                    let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-                    let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
-
-                    let raw_inv_denoms = inv_denoms.get(&point).unwrap();
-                    let scaled_inv_denoms: alloc::vec::Vec<Challenge> = raw_inv_denoms[..mat.height()]
-                        .par_iter()
-                        .map(|&inv_denom| inv_denom * alpha_pow_offset)
-                        .collect();
-
-                    reduced_opening_for_log_height
-                        .par_iter_mut()
-                        .zip_eq(mat.par_row_slices())
-                        .zip(scaled_inv_denoms.par_iter())
-                        .for_each(|((reduced_opening, row), &scaled_inv)| {
-                            let row_sum = alpha_reducer.reduce_base(row);
-                            *reduced_opening += scaled_inv * (row_sum - sum_alpha_pows_times_y);
-                        });
-
-                    num_reduced[log_height] += mat.width();
-                }
-            }
-            // Keep LDEs loaded for query phase
-        }
-        // FRI prove
-        let (fri_proof, query_indices) =
-            prover::prove(&self.fri, &reduced_openings, challenger);
-
-        // Phase 3: Query openings
-        let num_queries = query_indices.len();
-        let total_rounds = 1 + rounds.len();
-        let mut all_query_openings: Vec<Vec<BatchOpening<Val, InputMmcs>>> =
-            (0..num_queries).map(|_| Vec::with_capacity(total_rounds)).collect();
-
-        // Preprocessed round queries (read-only).
-        {
-            let log_max_height = log2_strict_usize(self.mmcs.get_max_height(preprocessed_data));
-            let bits_reduced = log_global_max_height - log_max_height;
-            for (qi, &index) in query_indices.iter().enumerate() {
-                let reduced_index = index >> bits_reduced;
-                let (opened_values, opening_proof) = self.mmcs.open_batch(reduced_index, preprocessed_data);
-                all_query_openings[qi].push(BatchOpening { opened_values, opening_proof });
-            }
+        // Build the rounds vec in the format `open` expects:
+        // [preprocessed, main, perm, quotient]
+        let mut open_rounds: Vec<(
+            &<InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>,
+            Vec<Vec<Challenge>>,
+        )> = Vec::with_capacity(1 + rounds.len());
+        open_rounds.push((preprocessed_data, preprocessed_points));
+        for (data, points) in rounds.iter() {
+            open_rounds.push((*data, points.clone()));
         }
 
-        // Mutable rounds queries.
-        for (data, _) in rounds.iter_mut() {
-            let log_max_height = log2_strict_usize(self.mmcs.get_max_height(*data));
-            let bits_reduced = log_global_max_height - log_max_height;
-
-            for (qi, &index) in query_indices.iter().enumerate() {
-                let reduced_index = index >> bits_reduced;
-                let (opened_values, opening_proof) = self.mmcs.open_batch(reduced_index, *data);
-                all_query_openings[qi].push(BatchOpening { opened_values, opening_proof });
-            }
-        }
-        (
-            all_opened_values,
-            TwoAdicFriPcsProof { fri_proof, query_openings: all_query_openings },
-        )
+        self.open(open_rounds, challenger)
     }
 }
 
@@ -1168,9 +935,9 @@ impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger>
     PcsOpenSequential<Val, Challenge, Challenger> for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
 where
     Val: TwoAdicField,
-    Dft: TwoAdicSubgroupDft<Val>,
-    InputMmcs: Mmcs<Val>,
-    FriMmcs: Mmcs<Challenge>,
+    Dft: TwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val> + Sync,
+    FriMmcs: Mmcs<Challenge> + Sync,
     Challenge: TwoAdicField + ExtensionField<Val>,
     Challenger: CanObserve<FriMmcs::Commitment>
         + CanSample<Challenge>

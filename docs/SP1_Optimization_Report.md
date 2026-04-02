@@ -31,6 +31,7 @@
 9. [Soundness Considerations](#9-soundness-considerations)
 10. [Production Readiness](#10-production-readiness)
 11. [Remaining Bottlenecks](#11-remaining-bottlenecks)
+12. [Ethereum Block Proving](#12-ethereum-block-proving-rsp-benchmark)
 
 ---
 
@@ -411,4 +412,101 @@ Further proof generation gains would require one or more of:
 
 ---
 
-*Report generated March 2026. All timings are proof generation times unless stated otherwise. All benchmarks on Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM) running macOS.*
+## 12. Ethereum Block Proving (RSP Benchmark)
+
+### Context
+
+After the Fibonacci optimizations reached a floor at 0.8s, work shifted to proving a **real Ethereum mainnet block** — a workload ~10,000× larger than Fibonacci. This tests whether the optimizations hold under production-scale memory and compute pressure.
+
+**Workload:** Ethereum mainnet block 20,526,624 via [RSP](https://github.com/succinctlabs/rsp) (58.5M cycles)
+**Challenge:** 18GB RAM is fundamentally insufficient for this workload's peak memory — the prover must survive 40GB+ of swap pressure without OOM or data corruption.
+
+### Result
+
+| Metric | Value |
+|--------|-------|
+| **Total prove time** | **1885s (31.4 min)** |
+| **Throughput** | **31.04 kHz** |
+| **Core shards** | 191 |
+| **Verification** | Passed (3.98s) |
+| **Peak swap** | ~46 GB |
+| **Peak RSS** | ~3 GB |
+| **GPU Merkle commits** | 0 (all CPU fallback) |
+| **Shard size** | 2^19 (524,288 cycles) |
+| **FRI queries** | 21 |
+
+### Per-Shard Phase Breakdown (191 shards, averages)
+
+```
+Total per shard: ~6.5s (average), 185s (worst — memory shard under 46GB swap)
+├── perm_trace:   462ms   (7%)
+├── perm_commit: 1340ms  (21%)  ← all CPU Merkle, no GPU
+├── quotient:    2178ms  (33%)  ← largest phase, sequential chip eval
+├── q_commit:     783ms  (12%)
+└── pcs_open:    1755ms  (27%)
+```
+
+### Critical Optimizations for ETH Block Proving
+
+The Fibonacci optimizations (GPU DFT, shape tuning, LDE caching, etc.) carried over, but the ETH block workload exposed new bottlenecks specific to memory-constrained operation at scale:
+
+| # | Optimization | Impact | Description |
+|---|---|---|---|
+| 1 | **Sequential quotient evaluation** | **Critical** | Changed `into_par_iter()` → `iter()` for CPU quotient path. Parallel eval materialized ~5GB of temporary LDE copies (6 threads × ~800MB each). Sequential reduces peak to ~800MB. Each chip's eval remains internally parallel via `par_chunks_mut`. **This was the fix that enabled completing all 191 shards.** |
+| 2 | Zero-copy transmute (memory trace) | Required | `Vec<[F; N]>` → `Vec<F>` without flatten copy. Saves ~27MB per memory trace. Without this, OOM at shard 117. |
+| 3 | Optimized quotient buffer reuse | Required | `par_chunks_mut` + `for_each_init` + bitwise AND mask. Eliminates per-iteration Vec allocations, saves ~32MB from rayon collect overhead. Without this, OOM at shard 117. |
+| 4 | Borrow memory events (skip clone+sort) | Small | Events arrive pre-sorted. Borrow instead of clone+sort saves ~2MB allocation + O(n log n) sort. |
+| 5 | Trace batch limiting | Medium | `TRACE_BATCH_LIMIT=1` — generate traces for 1 shard at a time instead of buffering multiple. Reduces memory pressure during checkpoint processing. |
+| 6 | `combine_memory_threshold` cap | Medium | Capped at 2048 for <33GB systems. Prevents 100K+ memory init/finalize events from packing into the last execution shard. |
+| 7 | Zero-copy permutation trace flatten | Small | Same transmute trick for perm traces. Avoids extension field → base field copy. |
+| 8 | Lowered GPU swap threshold | Config | `MAX_SWAP_BYTES` from 35GB → 25GB. Earlier CPU fallback under swap pressure. |
+| 9 | jemalloc dirty/muzzy decay | Config | `MALLOC_CONF="dirty_decay_ms:0,muzzy_decay_ms:0"` — immediate page return to OS. |
+
+### The OOM Problem
+
+Previous attempts (v1–v16) all failed at shard ~117 — the last execution shard before memory init/finalize shards begin. At this point:
+
+- **RAM**: 18GB fully consumed
+- **Swap**: 30–42GB and growing
+- **In memory**: all accumulated shard proofs (~191MB), LDE matrices for current shard (~2–4GB), plus system overhead
+- **The killer**: quotient evaluation's parallel chip processing allocated ~5GB of temporary matrix copies on top of existing LDE data
+
+The sequential quotient fix (#1 above) reduced temporary peak by ~4GB, which was exactly the margin needed to survive the critical shard under 40GB swap.
+
+### Proven NOT the Cause of OOM
+
+Through systematic ablation (v7–v16):
+
+| Hypothesis | Tested | Result |
+|------------|--------|--------|
+| Custom PCS open implementation | v7 vs v8 (SEQUENTIAL_OPEN=0) | Both fail verification at different shards — not the open path |
+| GPU Merkle | v14 (METAL_MERKLE=0) | Still OOM — GPU buffers aren't the bottleneck |
+| All GPU paths | v15 (no GPU) | Still OOM at 42GB swap — pure CPU can't fit either |
+| Lower swap threshold | v16 (25GB) | Still OOM — earlier CPU fallback doesn't help |
+| Quotient+memory optimizations | v12 (reverted all) | OOM at shard 117 — confirmed optimizations are necessary |
+| Smaller shard size | v13 (2^18) | Proof shapes force padding to 2^19, MORE shards = worse |
+
+### Environment Variables
+
+```bash
+SP1_DEV=true FRI_QUERIES=21 SHARD_SIZE=524288 SHARD_BATCH_SIZE=1 \
+MALLOC_NANO_ZONE=0 RAYON_NUM_THREADS=6 METAL_DFT=1 METAL_MERKLE=1 \
+KECCAK_THRESHOLD=5000 TRACE_GEN_THREADS=1 TRACE_BATCH_LIMIT=1 \
+RUST_LOG=info MALLOC_CONF="dirty_decay_ms:0,muzzy_decay_ms:0"
+```
+
+### Remaining Optimization Opportunities
+
+Ranked by expected impact:
+
+1. **Fix GPU Merkle correctness** — all 1338 commits fell back to CPU. GPU Merkle would speed up commits by 2-3× and reduce swap pressure by offloading to Metal buffers.
+2. **Avoid LDE copy in quotient eval** — pass matrix views directly to `quotient_values()` instead of `.to_row_major_matrix()`. Saves ~800MB per chip.
+3. **GPU constraint evaluation** — `METAL_CONSTRAINTS=1` path exists but is disabled. Would offload quotient computation to GPU.
+4. **Upgrade to SP1 v6** — upstream Plonky3 0.3.1 with basefold optimizations.
+5. **Serialize shard proofs to disk** — free ~191MB during late-stage proving.
+6. **Reduce main_commit clone overhead** — traces are cloned before PCS commit (~1GB temporary overlap).
+7. **NEON SIMD for CPU Poseidon2** — CPU Merkle hashing is the commit bottleneck (1.3s avg per shard).
+
+---
+
+*Report updated April 2026. Fibonacci benchmarks from March 2026. ETH block benchmarks from April 2026. All benchmarks on Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM) running macOS.*

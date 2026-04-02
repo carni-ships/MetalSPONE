@@ -34,7 +34,7 @@ impl SP1ProverOpts {
     #[must_use]
     pub fn cpu(cpu_ram_gb: usize) -> Self {
         let (log2_shard_size, shard_batch_size, log2_divisor) = match cpu_ram_gb {
-            0..33 => (19, 1, 3),
+            0..33 => (19, 1, 4),
             33..49 => (20, 1, 2),
             49..65 => (21, 1, 3),
             65..81 => (21, 3, 1),
@@ -54,6 +54,14 @@ impl SP1ProverOpts {
         opts.core_opts.split_opts.sha_extend /= divisor;
         opts.core_opts.split_opts.sha_compress /= divisor;
         opts.core_opts.split_opts.memory /= divisor;
+        opts.core_opts.split_opts.combine_memory_threshold /= divisor;
+
+        // On low-RAM systems, aggressively limit memory events combined into CPU shards
+        // to prevent OOM on the last CPU shard which inherits remaining memory events.
+        if cpu_ram_gb < 33 {
+            opts.core_opts.split_opts.combine_memory_threshold =
+                opts.core_opts.split_opts.combine_memory_threshold.min(1 << 11); // 2048
+        }
 
         // Allow overriding recursion batch size and workers via env vars.
         // batch_size=2 balances parallelism vs rayon contention on 12-core systems.
@@ -216,7 +224,7 @@ impl SplitOpts {
             keccak: 8 * deferred_split_threshold / 24,
             sha_extend: 32 * deferred_split_threshold / 48,
             sha_compress: 32 * deferred_split_threshold / 80,
-            memory: 64 * deferred_split_threshold,
+            memory: deferred_split_threshold,
         }
     }
 }

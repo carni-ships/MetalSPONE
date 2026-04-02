@@ -4051,8 +4051,6 @@ dependencies = [
 [[package]]
 name = "p3-baby-bear"
 version = "0.2.0-succinct"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "080896e9d09e9761982febafe3b3da5cbf320e32f0c89b6e2e01e875129f4c2d"
 dependencies = [
  "num-bigint 0.4.6",
  "p3-field",
@@ -4136,6 +4134,7 @@ name = "p3-fri"
 version = "0.2.0-succinct"
 dependencies = [
  "itertools 0.12.1",
+ "metal-ntt",
  "p3-challenger",
  "p3-commit",
  "p3-dft",

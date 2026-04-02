@@ -45,6 +45,10 @@ where
     let next_step = 1 << qdb;
 
     let ext_degree = SC::Challenge::D;
+    let perm_ext_width = perm_width / ext_degree;
+
+    // Bitwise AND mask — quotient_size is always a power of 2.
+    let qs_mask = quotient_size - 1;
 
     assert!(
         quotient_size >= PackedVal::<SC>::WIDTH,
@@ -54,116 +58,117 @@ where
         chip.name()
     );
 
-    (0..quotient_size)
-        .into_par_iter()
-        .step_by(PackedVal::<SC>::WIDTH)
-        .flat_map_iter(|i_start| {
-            let wrap = |i| i % quotient_size;
-            let i_range = i_start..i_start + PackedVal::<SC>::WIDTH;
+    // Pre-allocate output to avoid per-iteration collection overhead.
+    let mut results = vec![SC::Challenge::zero(); quotient_size];
 
-            let is_first_row = *PackedVal::<SC>::from_slice(&sels.is_first_row[i_range.clone()]);
-            let is_last_row = *PackedVal::<SC>::from_slice(&sels.is_last_row[i_range.clone()]);
-            let is_transition = *PackedVal::<SC>::from_slice(&sels.is_transition[i_range.clone()]);
-            let inv_zeroifier = *PackedVal::<SC>::from_slice(&sels.inv_zeroifier[i_range.clone()]);
+    results
+        .par_chunks_mut(PackedVal::<SC>::WIDTH)
+        .enumerate()
+        .for_each_init(
+            || {
+                // Per-thread reusable buffers — allocated once, reused across iterations.
+                (
+                    vec![PackedVal::<SC>::zero(); prep_width],
+                    vec![PackedVal::<SC>::zero(); prep_width],
+                    vec![PackedVal::<SC>::zero(); main_width],
+                    vec![PackedVal::<SC>::zero(); main_width],
+                    vec![PackedChallenge::<SC>::zero(); perm_ext_width],
+                    vec![PackedChallenge::<SC>::zero(); perm_ext_width],
+                )
+            },
+            |(prep_local, prep_next, local, next, perm_local, perm_next),
+             (chunk_idx, result_chunk)| {
+                let i_start = chunk_idx * PackedVal::<SC>::WIDTH;
+                let wrap = |i: usize| i & qs_mask;
+                let i_range = i_start..i_start + PackedVal::<SC>::WIDTH;
 
-            let prep_local: Vec<_> = (0..prep_width)
-                .map(|col| {
-                    PackedVal::<SC>::from_fn(|offset| {
+                let is_first_row =
+                    *PackedVal::<SC>::from_slice(&sels.is_first_row[i_range.clone()]);
+                let is_last_row =
+                    *PackedVal::<SC>::from_slice(&sels.is_last_row[i_range.clone()]);
+                let is_transition =
+                    *PackedVal::<SC>::from_slice(&sels.is_transition[i_range.clone()]);
+                let inv_zeroifier =
+                    *PackedVal::<SC>::from_slice(&sels.inv_zeroifier[i_range]);
+
+                for col in 0..prep_width {
+                    prep_local[col] = PackedVal::<SC>::from_fn(|offset| {
                         preprocessed_trace_on_quotient_domain
                             .as_ref()
                             .map_or(Val::<SC>::zero(), |x| x.get(wrap(i_start + offset), col))
-                    })
-                })
-                .collect();
-            let prep_next: Vec<_> = (0..prep_width)
-                .map(|col| {
-                    PackedVal::<SC>::from_fn(|offset| {
-                        preprocessed_trace_on_quotient_domain
-                            .as_ref()
-                            .map_or(Val::<SC>::zero(), |x| {
-                                x.get(wrap(i_start + next_step + offset), col)
-                            })
-                    })
-                })
-                .collect();
+                    });
+                    prep_next[col] = PackedVal::<SC>::from_fn(|offset| {
+                        preprocessed_trace_on_quotient_domain.as_ref().map_or(
+                            Val::<SC>::zero(),
+                            |x| x.get(wrap(i_start + next_step + offset), col),
+                        )
+                    });
+                }
 
-            let local: Vec<_> = (0..main_width)
-                .map(|col| {
-                    PackedVal::<SC>::from_fn(|offset| {
+                for col in 0..main_width {
+                    local[col] = PackedVal::<SC>::from_fn(|offset| {
                         main_trace_on_quotient_domain.get(wrap(i_start + offset), col)
-                    })
-                })
-                .collect();
-            let next: Vec<_> = (0..main_width)
-                .map(|col| {
-                    PackedVal::<SC>::from_fn(|offset| {
-                        main_trace_on_quotient_domain.get(wrap(i_start + next_step + offset), col)
-                    })
-                })
-                .collect();
+                    });
+                    next[col] = PackedVal::<SC>::from_fn(|offset| {
+                        main_trace_on_quotient_domain
+                            .get(wrap(i_start + next_step + offset), col)
+                    });
+                }
 
-            let perm_local: Vec<_> = (0..perm_width)
-                .step_by(ext_degree)
-                .map(|col| {
-                    PackedChallenge::<SC>::from_base_fn(|i| {
+                for (idx, col) in (0..perm_width).step_by(ext_degree).enumerate() {
+                    perm_local[idx] = PackedChallenge::<SC>::from_base_fn(|i| {
                         PackedVal::<SC>::from_fn(|offset| {
                             permutation_trace_on_quotient_domain
                                 .get(wrap(i_start + offset), col + i)
                         })
-                    })
-                })
-                .collect();
-
-            let perm_next: Vec<_> = (0..perm_width)
-                .step_by(ext_degree)
-                .map(|col| {
-                    PackedChallenge::<SC>::from_base_fn(|i| {
+                    });
+                    perm_next[idx] = PackedChallenge::<SC>::from_base_fn(|i| {
                         PackedVal::<SC>::from_fn(|offset| {
                             permutation_trace_on_quotient_domain
                                 .get(wrap(i_start + next_step + offset), col + i)
                         })
-                    })
-                })
-                .collect();
+                    });
+                }
 
-            let accumulator = PackedChallenge::<SC>::zero();
+                let accumulator = PackedChallenge::<SC>::zero();
+                let packed_local_cumulative_sum =
+                    PackedChallenge::<SC>::from_f(*local_cumulative_sum);
 
-            let packed_local_cumulative_sum = PackedChallenge::<SC>::from_f(*local_cumulative_sum);
+                let mut folder = ProverConstraintFolder {
+                    preprocessed: VerticalPair::new(
+                        RowMajorMatrixView::new_row(prep_local),
+                        RowMajorMatrixView::new_row(prep_next),
+                    ),
+                    main: VerticalPair::new(
+                        RowMajorMatrixView::new_row(local),
+                        RowMajorMatrixView::new_row(next),
+                    ),
+                    perm: VerticalPair::new(
+                        RowMajorMatrixView::new_row(perm_local),
+                        RowMajorMatrixView::new_row(perm_next),
+                    ),
+                    perm_challenges,
+                    local_cumulative_sum: &packed_local_cumulative_sum,
+                    global_cumulative_sum,
+                    is_first_row,
+                    is_last_row,
+                    is_transition,
+                    alpha,
+                    accumulator,
+                    public_values,
+                };
+                chip.eval(&mut folder);
 
-            let mut folder = ProverConstraintFolder {
-                preprocessed: VerticalPair::new(
-                    RowMajorMatrixView::new_row(&prep_local),
-                    RowMajorMatrixView::new_row(&prep_next),
-                ),
-                main: VerticalPair::new(
-                    RowMajorMatrixView::new_row(&local),
-                    RowMajorMatrixView::new_row(&next),
-                ),
-                perm: VerticalPair::new(
-                    RowMajorMatrixView::new_row(&perm_local),
-                    RowMajorMatrixView::new_row(&perm_next),
-                ),
-                perm_challenges,
-                local_cumulative_sum: &packed_local_cumulative_sum,
-                global_cumulative_sum,
-                is_first_row,
-                is_last_row,
-                is_transition,
-                alpha,
-                accumulator,
-                public_values,
-            };
-            chip.eval(&mut folder);
+                let quotient = folder.accumulator * inv_zeroifier;
 
-            // quotient(x) = constraints(x) / Z_H(x)
-            let quotient = folder.accumulator * inv_zeroifier;
+                for idx_in_packing in 0..PackedVal::<SC>::WIDTH {
+                    result_chunk[idx_in_packing] =
+                        SC::Challenge::from_base_fn(|coeff_idx| {
+                            quotient.as_base_slice()[coeff_idx].as_slice()[idx_in_packing]
+                        });
+                }
+            },
+        );
 
-            // "Transpose" D packed base coefficients into WIDTH scalar extension coefficients.
-            (0..PackedVal::<SC>::WIDTH).map(move |idx_in_packing| {
-                SC::Challenge::from_base_fn(|coeff_idx| {
-                    quotient.as_base_slice()[coeff_idx].as_slice()[idx_in_packing]
-                })
-            })
-        })
-        .collect()
+    results
 }

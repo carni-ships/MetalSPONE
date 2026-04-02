@@ -16,7 +16,7 @@ pub fn setup_logger() {
             .unwrap_or_else(|_| EnvFilter::new("off"))
             .add_directive("hyper=off".parse().unwrap())
             .add_directive("p3_keccak_air=off".parse().unwrap())
-            .add_directive("p3_fri=off".parse().unwrap())
+            .add_directive("p3_fri=info".parse().unwrap())
             .add_directive("p3_dft=off".parse().unwrap())
             .add_directive("p3_challenger=off".parse().unwrap())
             .add_directive("sp1_cuda=off".parse().unwrap());

@@ -1,9 +1,20 @@
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Configure jemalloc: immediate page return to OS to minimize RSS under memory pressure.
+/// Prevents RSS accumulation across shard boundaries that causes swap thrashing.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+
 use alloy_primitives::B256;
 use clap::Parser;
 use rsp_client_executor::{io::ClientExecutorInput, CHAIN_ID_ETH_MAINNET};
 use std::path::PathBuf;
 
-use sp1_sdk::{include_elf, utils, ProverClient, SP1Stdin};
+use sp1_sdk::{include_elf, utils, Prover, ProverClient, SP1Stdin};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -21,44 +32,52 @@ fn load_input_from_cache(chain_id: u64, block_number: u64) -> ClientExecutorInpu
 }
 
 fn main() {
-    // Initialize the logger.
     utils::setup_logger();
-
-    // Parse the command line arguments.
     let args = Args::parse();
-
-    // Load the input from the cache.
     let client_input = load_input_from_cache(CHAIN_ID_ETH_MAINNET, 20526624);
 
-    // Generate the proof.
-    let client = ProverClient::from_env();
+    // Optional cycle limit: CYCLE_LIMIT=600000 → ~1 shard, core-only, no recursion.
+    let cycle_limit: Option<u64> = std::env::var("CYCLE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok());
 
-    // Setup the proving key and verification key.
-    let (pk, vk) = client.setup(include_elf!("rsp-program"));
+    let prover = ProverClient::builder().cpu().build();
+    let (pk, vk) = prover.setup(include_elf!("rsp-program"));
 
-    // Write the block to the program's stdin.
     let mut stdin = SP1Stdin::new();
     let buffer = bincode::serialize(&client_input).unwrap();
     stdin.write_vec(buffer);
 
-    // Only execute the program.
-    let (mut public_values, execution_report) = client.execute(&pk.elf, &stdin).run().unwrap();
-    println!(
-        "Finished executing the block in {} cycles",
-        execution_report.total_instruction_count()
-    );
+    // Skip full execution when using cycle limit (saves ~2 min).
+    if cycle_limit.is_none() {
+        let (mut public_values, execution_report) = prover.execute(&pk.elf, &stdin).run().unwrap();
+        println!(
+            "Finished executing the block in {} cycles",
+            execution_report.total_instruction_count()
+        );
+        let block_hash = public_values.read::<B256>();
+        println!("success: block_hash={block_hash}");
+    }
 
-    // Read the block hash.
-    let block_hash = public_values.read::<B256>();
-    println!("success: block_hash={block_hash}");
-
-    // If the `prove` argument was passed in, actually generate the proof.
-    // It is strongly recommended you use the network prover given the size of these programs.
     if args.prove {
         println!("Starting proof generation.");
-        let proof = client.prove(&pk, &stdin).run().expect("Proving should work.");
+
+        let proof = if let Some(limit) = cycle_limit {
+            println!("Cycle limit set to {limit} (~{} shards, core-only)", limit / 524288 + 1);
+            prover.prove(&pk, &stdin)
+                .core()
+                .cycle_limit(limit)
+                .run()
+                .expect("Proving should work.")
+        } else {
+            prover.prove(&pk, &stdin)
+                .run()
+                .expect("Proving should work.")
+        };
         println!("Proof generation finished.");
 
-        client.verify(&proof, &vk).expect("proof verification should succeed");
+        if cycle_limit.is_none() {
+            prover.verify(&proof, &vk).expect("proof verification should succeed");
+        }
     }
 }

@@ -64,8 +64,8 @@ pub(crate) fn create_local_command(
         .env("CARGO_ENCODED_RUSTFLAGS", get_rust_compiler_flags(args, &parsed_version))
         .env_remove("RUSTC")
         .env("CARGO_TARGET_DIR", program_metadata.target_directory.join(HELPER_TARGET_SUBDIR))
-        // TODO: remove once trim-paths is supported - https://github.com/rust-lang/rust/issues/111540
-        .env("RUSTC_BOOTSTRAP", "1") // allows trim-paths.
+        // RUSTC_BOOTSTRAP=1 was previously needed for -Ztrim-paths, which has been removed
+        // due to incompatibility between nightly cargo and the succinct toolchain's rustc.
         .args(get_program_build_args(args));
     env::vars()
         .map(|v| v.0)

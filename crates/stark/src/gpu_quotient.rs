@@ -96,6 +96,11 @@ where
         public_values,
     );
 
+    tracing::debug!(
+        "GPU constraint compile: quotient_size={} num_regs={} num_instr={}",
+        quotient_size, program.num_regs, program.num_instructions()
+    );
+
     if program.num_regs > 4096 {
         return None;
     }

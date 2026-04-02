@@ -103,17 +103,19 @@ impl<F: PrimeField32> MachineAir<F> for MemoryGlobalChip {
         input: &ExecutionRecord,
         _output: &mut ExecutionRecord,
     ) -> RowMajorMatrix<F> {
-        let mut memory_events = match self.kind {
-            MemoryChipType::Initialize => input.global_memory_initialize_events.clone(),
-            MemoryChipType::Finalize => input.global_memory_finalize_events.clone(),
+        let memory_events = match self.kind {
+            MemoryChipType::Initialize => &input.global_memory_initialize_events,
+            MemoryChipType::Finalize => &input.global_memory_finalize_events,
         };
+        debug_assert!(
+            memory_events.windows(2).all(|w| w[0].addr <= w[1].addr),
+            "memory events must be pre-sorted by addr"
+        );
 
         let previous_addr_bits = match self.kind {
             MemoryChipType::Initialize => input.public_values.previous_init_addr_bits,
             MemoryChipType::Finalize => input.public_values.previous_finalize_addr_bits,
         };
-
-        memory_events.sort_by_key(|event| event.addr);
         let mut rows: Vec<[F; NUM_MEMORY_INIT_COLS]> = memory_events
             .par_iter()
             .map(|event| {
@@ -172,7 +174,16 @@ impl<F: PrimeField32> MachineAir<F> for MemoryGlobalChip {
             [F::zero(); NUM_MEMORY_INIT_COLS],
         );
 
-        RowMajorMatrix::new(rows.into_iter().flatten().collect::<Vec<_>>(), NUM_MEMORY_INIT_COLS)
+        // Zero-copy reinterpret Vec<[F; N]> as Vec<F>.
+        // Safe because arrays have no padding and same alignment as elements.
+        let flat = {
+            let len = rows.len() * NUM_MEMORY_INIT_COLS;
+            let cap = rows.capacity() * NUM_MEMORY_INIT_COLS;
+            let ptr = rows.as_mut_ptr() as *mut F;
+            std::mem::forget(rows);
+            unsafe { Vec::from_raw_parts(ptr, len, cap) }
+        };
+        RowMajorMatrix::new(flat, NUM_MEMORY_INIT_COLS)
     }
 
     fn included(&self, shard: &Self::Record) -> bool {

@@ -283,7 +283,12 @@ where
             .collect::<Vec<_>>();
 
         // Commit to the batch of traces.
+        let t_main_commit = std::time::Instant::now();
         let (main_commit, main_data) = pcs.commit(domains_and_traces);
+        let main_commit_ms = t_main_commit.elapsed().as_secs_f64() * 1000.0;
+        if main_commit_ms > 50.0 {
+            tracing::info!("main_commit: {:.0}ms", main_commit_ms);
+        }
 
         // Get the chip ordering.
         let chip_ordering =
@@ -416,7 +421,19 @@ where
                     .into_iter()
                     .zip(trace_domains.iter())
                     .map(|(perm_trace, domain)| {
-                        let trace = perm_trace.flatten_to_base();
+                        // Zero-copy flatten: EF4 = BinomialExtensionField<BabyBear, 4>
+                        // is repr(C) with [BabyBear; 4], and BabyBear is repr(transparent)
+                        // wrapping u32. So Vec<EF4> has identical layout to Vec<BabyBear>
+                        // with 4× the length. This avoids a full-matrix copy.
+                        let ext_width = perm_trace.width();
+                        let base_width = ext_width * <SC::Challenge as AbstractExtensionField<Val<SC>>>::D;
+                        let values = perm_trace.values;
+                        let base_len = values.len() * <SC::Challenge as AbstractExtensionField<Val<SC>>>::D;
+                        let base_cap = values.capacity() * <SC::Challenge as AbstractExtensionField<Val<SC>>>::D;
+                        let base_ptr = values.as_ptr() as *mut Val<SC>;
+                        std::mem::forget(values);
+                        let base_values = unsafe { Vec::from_raw_parts(base_ptr, base_len, base_cap) };
+                        let trace = RowMajorMatrix::new(base_values, base_width);
                         (*domain, trace)
                     })
                     .collect::<Vec<_>>()
@@ -517,11 +534,10 @@ where
                                 |&index| {
                                     std::mem::transmute(
                                         pcs.get_evaluations_on_domain(
-                                            &pk.data,
-                                            index,
-                                            *quotient_domain,
-                                        )
-                                        .to_row_major_matrix(),
+                                                &pk.data,
+                                                index,
+                                                *quotient_domain,
+                                            ).to_row_major_matrix(),
                                     )
                                 },
                             );
@@ -532,8 +548,7 @@ where
                                     &data.main_data,
                                     i,
                                     *quotient_domain,
-                                )
-                                .to_row_major_matrix(),
+                                ).to_row_major_matrix(),
                             );
                             let perm_trace: p3_matrix::dense::RowMajorMatrix<
                                 p3_baby_bear::BabyBear,
@@ -542,8 +557,7 @@ where
                                     &permutation_data,
                                     i,
                                     *quotient_domain,
-                                )
-                                .to_row_major_matrix(),
+                                ).to_row_major_matrix(),
                             );
 
                             // Try to prepare GPU dispatch
@@ -572,6 +586,11 @@ where
                             }
                             // Traces are dropped here; Metal buffers hold copies
                         }
+
+                        tracing::info!(
+                            "GPU constraints: {} chips on GPU, {} on CPU",
+                            gpu_dispatches.len(), cpu_indices.len()
+                        );
 
                         // Phase 2: Batch GPU dispatch — single command buffer
                         let gpu_cmd = if !gpu_dispatches.is_empty() {
@@ -604,22 +623,19 @@ where
                                             index,
                                             quotient_domain,
                                         )
-                                        .to_row_major_matrix()
                                     });
                                 let main = pcs
                                     .get_evaluations_on_domain(
                                         &data.main_data,
                                         i,
                                         quotient_domain,
-                                    )
-                                    .to_row_major_matrix();
+                                    );
                                 let perm = pcs
                                     .get_evaluations_on_domain(
                                         &permutation_data,
                                         i,
                                         quotient_domain,
-                                    )
-                                    .to_row_major_matrix();
+                                    );
                                 let qv = quotient_values(
                                     chips[i],
                                     &local_cumulative_sums[i],
@@ -661,9 +677,12 @@ where
             }
 
             // CPU fallback path (also used on non-macOS).
+            // Process chips sequentially to avoid materializing multiple large
+            // LDE copies simultaneously. Each chip's quotient_values() is
+            // already internally parallelized via par_chunks_mut.
             quotient_domains
                 .as_slice()
-                .into_par_iter()
+                .iter()
                 .enumerate()
                 .map(|(i, quotient_domain)| {
                     tracing::debug_span!(parent: &parent_span, "compute quotient values for domain")
@@ -671,14 +690,11 @@ where
                             let preprocessed_trace_on_quotient_domains =
                                 pk.chip_ordering.get(&chips[i].name()).map(|&index| {
                                     pcs.get_evaluations_on_domain(&pk.data, index, *quotient_domain)
-                                        .to_row_major_matrix()
                                 });
-                            let main_trace_on_quotient_domains = pcs
-                                .get_evaluations_on_domain(&data.main_data, i, *quotient_domain)
-                                .to_row_major_matrix();
-                            let permutation_trace_on_quotient_domains = pcs
-                                .get_evaluations_on_domain(&permutation_data, i, *quotient_domain)
-                                .to_row_major_matrix();
+                            let main_trace_on_quotient_domains =
+                                pcs.get_evaluations_on_domain(&data.main_data, i, *quotient_domain);
+                            let permutation_trace_on_quotient_domains =
+                                pcs.get_evaluations_on_domain(&permutation_data, i, *quotient_domain);
                             quotient_values(
                                 chips[i],
                                 &local_cumulative_sums[i],

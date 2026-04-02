@@ -1,8 +1,8 @@
 # MetalSPONE 🥄✨
 
-**SP1 Proof Generation Optimization for Apple Silicon — 63x faster proving on an 18GB M3 Pro**
+**SP1 Proof Generation Optimization for Apple Silicon — 15x faster at production soundness, 56x faster at dev config, on an 18GB M3 Pro**
 
-This is a fork of [SP1 v4.0.0](https://github.com/succinctlabs/sp1) with systematic **proof generation** optimizations developed over 21 sessions, reducing the Fibonacci benchmark (prove\_core + compress) from **50.5 seconds to 0.8 seconds**.
+This is a fork of [SP1 v4.0.0](https://github.com/succinctlabs/sp1) with systematic **proof generation** optimizations developed over 23 sessions, reducing the Fibonacci benchmark from **50.5 seconds to 3.4 seconds at production FRI config** (FRI\_QUERIES=100, ~100 bits soundness) and **0.9 seconds at dev config** (FRI\_QUERIES=1).
 
 > **Note:** All timings in this project refer to **proof generation** (the computationally expensive step), not proof verification. Verification is near-instant: ~1-10ms off-chain, ~150K gas on-chain (Groth16 on Ethereum). See [Proof Generation vs Verification](#proof-generation-vs-verification) for details.
 
@@ -12,16 +12,24 @@ A detailed research report is available in [`docs/SP1_Optimization_Report.md`](d
 
 All metrics below are for **proof generation** (the prover). Verification costs are unchanged.
 
-| Metric | Original SP1 | MetalSPONE | Improvement |
-|--------|-------------|------------|-------------|
-| Proof generation time | 50.5s | 0.8s | **63x faster** |
-| Prover throughput | ~100 Hz | ~6,400 Hz | 64x |
-| Peak memory (prover) | ~10 GB | ~7 GB | 30% reduction |
-| Compress proofs generated | 9 | 1 | 9x fewer |
-| Circuit padding waste | 140-150% | <2% | ~75x reduction |
-| Prover startup time | 85s | <1s | 85x faster |
+| Metric | Original SP1 | MetalSPONE (prod) | MetalSPONE (dev) |
+|--------|-------------|-------------------|------------------|
+| Proof generation time | 50.5s | **3.4s** (15x) | **0.9s** (56x) |
+| FRI soundness | ~100 bits | ~100 bits | ~4 bits |
+| Peak memory (prover) | ~10 GB | ~7 GB | ~7 GB |
+| Compress proofs generated | 9 | 1 | 1 |
+| Circuit padding waste | 140-150% | <5% | <2% |
+| Prover startup time | 85s | <1s | <1s |
 
-*Benchmarked on Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM). Dev/benchmark config: FRI\_QUERIES=1, LOG\_BLOWUP=4, VERIFY\_VK=false.*
+| FRI Config | Soundness | Median Time | Speedup |
+|------------|-----------|-------------|---------|
+| `FRI_QUERIES=100, LOG_BLOWUP=1` | ~100 bits | **3.4s** | 15x |
+| `FRI_QUERIES=50, LOG_BLOWUP=1` | ~66 bits | **2.6s** | 19x |
+| `FRI_QUERIES=33, LOG_BLOWUP=2` | ~82 bits | **1.7s** | 30x |
+| `FRI_QUERIES=10, LOG_BLOWUP=3` | ~46 bits | **1.1s** | 46x |
+| `FRI_QUERIES=1, LOG_BLOWUP=4` | ~4 bits | **0.9s** | 56x |
+
+*Benchmarked on Apple M3 Pro (12 CPU cores, 18 GPU cores, 18GB RAM). All configs: SHARD\_BATCH\_SIZE=3, VERIFY\_VK=false, METAL\_DFT=1.*
 
 ## Proof Generation vs Verification
 
@@ -40,26 +48,28 @@ ZK proof systems have two distinct operations with vastly different computationa
 
 ## Production Readiness
 
-The 0.8s headline number uses an aggressive benchmark config (`FRI_QUERIES=1`, ~4 bits of soundness). **This is not production-grade.**
+All FRI configs run successfully on 18GB, including full production soundness:
 
 | Config | Soundness | Proof Gen Time | Use Case |
 |--------|-----------|---------------|----------|
-| `FRI_QUERIES=1, LOG_BLOWUP=4` | ~4 bits | **0.8s** | Dev / benchmarking only |
-| `FRI_QUERIES=33, LOG_BLOWUP=2` | ~66 bits | ~3-5s (est.) | Moderate security |
-| `FRI_QUERIES=100, LOG_BLOWUP=1` | ~100+ bits | ~8-15s (est.) | Production |
+| `FRI_QUERIES=1, LOG_BLOWUP=4` | ~4 bits | **0.9s** | Dev / benchmarking only |
+| `FRI_QUERIES=10, LOG_BLOWUP=3` | ~46 bits | **1.1s** | Light security |
+| `FRI_QUERIES=33, LOG_BLOWUP=2` | ~82 bits | **1.7s** | Moderate security |
+| `FRI_QUERIES=50, LOG_BLOWUP=1` | ~66 bits | **2.6s** | Good security |
+| `FRI_QUERIES=100, LOG_BLOWUP=1` | ~100+ bits | **3.4s** | **Full production** |
 
-Production configs have larger recursion circuits (BatchFRI grows from 2^12 to 2^19) which increases compress time significantly. However, all core optimizations — GPU acceleration, shape tuning, batching, LDE caching, batch inversion, etc. — apply equally to production configs. The estimated production improvement is **~4-6x over unmodified SP1** (vs 63x at benchmark config).
+All core optimizations — GPU acceleration, shape tuning, batching, LDE caching, batch inversion, lazy program construction — apply at every FRI config level.
 
 ### Production Throughput
 
-On a single M3 Pro at production FRI config (~8-15s per proof):
+On a single M3 Pro at production FRI config (3.4s per proof):
 
 | Use Case | Throughput Needed | Single M3 Pro | Notes |
 |----------|------------------|---------------|-------|
-| On-chain attestation (periodic) | 1 proof/min | Sufficient | Ample headroom |
-| Bridge (per-block, 12s slots) | 5 proofs/min | Borderline | Depends on program complexity |
-| High-throughput rollup | 10+ proofs/min | Insufficient | Needs parallel provers |
-| Real-time proving | Sub-second | Insufficient | Only achievable at benchmark config |
+| On-chain attestation (periodic) | 1 proof/min | **Sufficient** | ~17 proofs/min capacity |
+| Bridge (per-block, 12s slots) | 5 proofs/min | **Sufficient** | ~3.5x headroom |
+| High-throughput rollup | 10+ proofs/min | **Sufficient** | Up to ~17 proofs/min |
+| Real-time proving | Sub-second | Borderline | 0.9s at dev config, 1.7s at q=33 |
 
 ### Scaling Strategies
 
@@ -98,6 +108,7 @@ A typical production deployment would run multiple prover instances behind a job
 ### Compress Tree (Proof Generation)
 - `first_layer_batch_size=2`, `REDUCE_BATCH_SIZE=3` — reduces 9 compress proofs to 1
 - PK cache in compress workers
+- **Lazy program construction** — disabled eager precomputation of all shape combinations (11^3 = 1331 programs), which was causing OOM on 18GB at production FRI configs. Programs now built on-demand with negligible overhead (~50ms per unique shape).
 
 ### FRI Parameter Overrides
 - `FRI_QUERIES` env var (default 100) — controls number of FRI query openings
@@ -119,25 +130,40 @@ Baseline .......... 50.5s  (1x)
 + Preprocessed ....  0.9s  (56.1x)  Session 19
 + Micro shape .....  0.8s  (63.1x)  Session 20
   Final assessment .  0.8s  (floor)  Session 21
++ Prod config fix .  3.2s  (q=100)  Session 23
 ```
 
-## Proof Generation Breakdown at 0.8s
+## Proof Generation Breakdown
 
+### Dev config (FRI_QUERIES=1, 0.9s median)
 ```
-Total proof generation: ~0.80s
-+-- prove_core: ~0.47s (59%)
-|   +-- trace gen:       43ms
-|   +-- commit:          72ms
+Total: ~0.9s
++-- prove_core: ~0.5s (56%)
+|   +-- trace gen:       40ms
 |   +-- perm_trace:      20ms
-|   +-- perm_commit:     35ms
-|   +-- quotient:        95ms
-|   +-- q_commit:        46ms
-|   +-- pcs_open:       158ms
-+-- compress: ~0.25s (31%)
-|   +-- setup:           35ms
-|   +-- commit:          48ms
+|   +-- quotient:       100ms
+|   +-- pcs_open:       150ms
++-- compress: ~0.35s (39%)
+|   +-- setup:           40ms
+|   +-- commit:          50ms
 |   +-- open:           165ms
-+-- overhead: ~0.08s (10%)
++-- overhead: ~0.05s (5%)
+```
+
+### Production config (FRI_QUERIES=100, 3.4s median)
+```
+Total: ~3.4s
++-- prove_core: ~0.5s (15%)
++-- compress: ~2.7s (79%)
+|   +-- setup:          220ms
+|   +-- commit:         350ms
+|   +-- open:          1800ms
+|       +-- perm_trace:   150ms
+|       +-- perm_commit:  300ms
+|       +-- quotient:     380ms
+|       +-- q_commit:     180ms
+|       +-- pcs_open:     770ms
++-- overhead: ~0.2s (6%)
 ```
 
 ## Quick Start
@@ -146,7 +172,11 @@ Total proof generation: ~0.80s
 # Build with release optimizations
 cargo build --release -p sp1-prover
 
-# Run the Fibonacci proof generation benchmark (aggressive config)
+# Run at production FRI config (q=100, ~100 bits soundness, ~3.2s)
+SHARD_BATCH_SIZE=3 VERIFY_VK=false FRI_QUERIES=100 LOG_BLOWUP=1 METAL_DFT=1 \
+  cargo test --release -p sp1-prover -- bench_compress --nocapture
+
+# Run at dev config (q=1, fastest, ~0.9s)
 SHARD_BATCH_SIZE=3 VERIFY_VK=false FRI_QUERIES=1 LOG_BLOWUP=4 METAL_DFT=1 \
   cargo test --release -p sp1-prover -- bench_compress --nocapture
 ```
@@ -162,6 +192,7 @@ SHARD_BATCH_SIZE=3 VERIFY_VK=false FRI_QUERIES=1 LOG_BLOWUP=4 METAL_DFT=1 \
 | `VERIFY_VK` | true | Verify recursion VK map (false skips 85s startup) |
 | `METAL_DFT` | 0 | Enable Metal GPU DFT (macOS only) |
 | `METAL_CONSTRAINTS` | 0 | Enable Metal GPU constraint evaluation |
+| `SP1_PROGRAM_CACHE` | false | Eagerly precompute all compress programs (uses more RAM) |
 
 ## Project Structure
 

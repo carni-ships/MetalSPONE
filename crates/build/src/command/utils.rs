@@ -21,7 +21,11 @@ pub(crate) fn get_program_build_args(args: &BuildArgs) -> Vec<String> {
         build_args.push("--ignore-rust-version".to_string());
     }
 
-    build_args.push("-Ztrim-paths".to_string());
+    // Note: -Ztrim-paths is omitted because the succinct toolchain's rustc (1.93.0-dev)
+    // does not support --remap-path-scope as a stable flag, but newer cargo versions
+    // (1.96+) pass it that way. This causes build failures when cargo falls back to a
+    // nightly toolchain. Trim-paths only affects path sanitization in binaries, not
+    // correctness.
 
     for p in &args.packages {
         build_args.push("-p".to_string());

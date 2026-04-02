@@ -115,9 +115,7 @@ pub(crate) fn create_docker_command(
         format!("CARGO_TARGET_DIR={}", target_dir),
         "-e".to_string(),
         format!("RUSTUP_TOOLCHAIN={}", super::TOOLCHAIN_NAME),
-        // TODO: remove once trim-paths is supported - https://github.com/rust-lang/rust/issues/111540
-        "-e".to_string(),
-        "RUSTC_BOOTSTRAP=1".to_string(), // allows trim-paths.
+        // RUSTC_BOOTSTRAP=1 removed along with -Ztrim-paths (see utils.rs).
         "-e".to_string(),
         format!("CARGO_ENCODED_RUSTFLAGS={}", get_rust_compiler_flags(args, &parsed_version)),
         "--entrypoint".to_string(),

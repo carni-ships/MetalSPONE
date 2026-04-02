@@ -348,7 +348,12 @@ impl<SC: StarkGenericConfig, A: MachineAir<Val<SC>>> StarkMachine<SC, A> {
                         &mut shard_challenger,
                         shard_proof,
                     )
-                    .map_err(MachineVerificationError::InvalidShardProof)
+                    .map_err(|e| {
+                        eprintln!("[verify] FAILED shard {} with {:?}", i, e);
+                        eprintln!("[verify] shard {} chips: {:?}", i,
+                            shard_proof.chip_ordering.keys().collect::<Vec<_>>());
+                        MachineVerificationError::InvalidShardProof(e)
+                    })
                 })?;
             }
 
