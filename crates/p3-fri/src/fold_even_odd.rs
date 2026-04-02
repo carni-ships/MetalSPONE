@@ -16,7 +16,7 @@ use tracing::instrument;
 /// ```
 /// Expects input to be bit-reversed evaluations.
 #[instrument(skip_all, level = "debug")]
-pub fn fold_even_odd<F: TwoAdicField>(poly: Vec<F>, beta: F) -> Vec<F> {
+pub fn fold_even_odd<F: TwoAdicField>(mut poly: Vec<F>, beta: F) -> Vec<F> {
     // We use the fact that
     //     p_e(x^2) = (p(x) + p(-x)) / 2
     //     p_o(x^2) = (p(x) - p(-x)) / (2 x)
@@ -40,23 +40,29 @@ pub fn fold_even_odd<F: TwoAdicField>(poly: Vec<F>, beta: F) -> Vec<F> {
         .collect_vec();
     reverse_slice_index_bits(&mut powers);
 
-    // Operate directly on the slice — no RowMajorMatrix allocation needed.
-    // poly is laid out as [r0_0, r1_0, r0_1, r1_1, ...] (pairs of even/odd).
+    // In-place fold: write results into the first half of the input Vec,
+    // avoiding a separate output allocation. Safe because each iteration i
+    // reads from indices {2*i, 2*i+1} and writes to index {i}; since 2*i >= i,
+    // writes never overwrite data that a later iteration still needs.
     //
     // Rewrite: (1/2 + p)*r0 + (1/2 - p)*r1 = 1/2*(r0+r1) + p*(r0-r1)
-    // This replaces one EF×EF multiply with a cheaper EF×scalar multiply
-    // (one_half is embedded from the base field, so multiplication is component-wise).
+    // Use AtomicPtr as a Send+Sync wrapper for the raw pointer.
+    let ptr = core::sync::atomic::AtomicPtr::new(poly.as_mut_ptr());
     powers
         .into_par_iter()
         .enumerate()
-        .map(|(i, power)| {
-            let r0 = poly[2 * i];
-            let r1 = poly[2 * i + 1];
-            let sum = r0 + r1;
-            let diff = r0 - r1;
-            one_half * sum + power * diff
-        })
-        .collect()
+        .for_each(|(i, power)| {
+            // SAFETY: Each iteration reads {2*i, 2*i+1} and writes {i}.
+            // These index sets are disjoint across iterations, so no data races.
+            unsafe {
+                let p = ptr.load(core::sync::atomic::Ordering::Relaxed);
+                let r0 = *p.add(2 * i);
+                let r1 = *p.add(2 * i + 1);
+                *p.add(i) = one_half * (r0 + r1) + power * (r0 - r1);
+            }
+        });
+    poly.truncate(half_len);
+    poly
 }
 
 #[cfg(test)]
