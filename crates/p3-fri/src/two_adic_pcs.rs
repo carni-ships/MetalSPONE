@@ -800,31 +800,21 @@ where
     {
         assert_eq!(rounds.len(), saved_ldes.len());
 
-        // Phase 0: Compute dimensions. Temporarily restore LDEs to read dimensions, then take back.
+        // Phase 0: Compute dimensions directly from saved LDEs (no restore needed).
         let mut global_max_height: usize = 0;
         let mut global_max_width: usize = 0;
-        let round_dims: Vec<Vec<Dimensions>> = rounds
-            .iter_mut()
-            .zip(saved_ldes.iter_mut())
-            .map(|((data, _), saved)| {
-                let needs_restore = saved.is_some();
-                if let Some(ldes) = saved.take() {
-                    data.restore_leaves_rm(ldes);
-                }
-                let dims: Vec<Dimensions> = self.mmcs
-                    .get_matrices(*data)
-                    .iter()
-                    .map(|m| {
+        let round_dims: Vec<Vec<Dimensions>> = saved_ldes
+            .iter()
+            .map(|saved| {
+                match saved {
+                    Some(ldes) => ldes.iter().map(|m| {
                         let d = m.dimensions();
                         global_max_height = global_max_height.max(d.height);
                         global_max_width = global_max_width.max(d.width);
                         d
-                    })
-                    .collect();
-                if needs_restore {
-                    *saved = Some(data.take_leaves_rm());
+                    }).collect(),
+                    None => vec![],
                 }
-                dims
             })
             .collect();
 
@@ -963,20 +953,26 @@ where
                     }
                 }
             }
-            // Keep LDEs loaded for query phase
+            // Take LDE back — only 1 round in memory at a time during reduction.
+            if data.has_leaves_rm() {
+                saved_ldes[ri] = Some(data.take_leaves_rm());
+            }
         }
 
         // FRI prove
         let (fri_proof, query_indices) =
             prover::prove(&self.fri, &reduced_openings, challenger);
 
-        // Phase 3: Query openings
+        // Phase 3: Query openings — restore one round at a time.
         let num_queries = query_indices.len();
         let num_rounds = rounds.len();
         let mut all_query_openings: Vec<Vec<BatchOpening<Val, InputMmcs>>> =
             (0..num_queries).map(|_| Vec::with_capacity(num_rounds)).collect();
 
-        for (data, _) in rounds.iter_mut() {
+        for (ri, (data, _)) in rounds.iter_mut().enumerate() {
+            if let Some(ldes) = saved_ldes[ri].take() {
+                data.restore_leaves_rm(ldes);
+            }
             let log_max_height = log2_strict_usize(self.mmcs.get_max_height(*data));
             let bits_reduced = log_global_max_height - log_max_height;
 
@@ -984,6 +980,11 @@ where
                 let reduced_index = index >> bits_reduced;
                 let (opened_values, opening_proof) = self.mmcs.open_batch(reduced_index, *data);
                 all_query_openings[qi].push(BatchOpening { opened_values, opening_proof });
+            }
+
+            // Take LDE back — only 1 round in memory at a time during queries.
+            if data.has_leaves_rm() {
+                saved_ldes[ri] = Some(data.take_leaves_rm());
             }
         }
 
@@ -1043,29 +1044,23 @@ where
             })
             .collect();
 
-        // Other rounds: temporarily restore LDEs to read dimensions, then take back.
-        let round_dims: Vec<Vec<Dimensions>> = rounds
-            .iter_mut()
-            .zip(saved_ldes.iter_mut())
-            .map(|((data, _), saved)| {
-                let needs_restore = saved.is_some();
-                if let Some(ldes) = saved.take() {
-                    data.restore_leaves_rm(ldes);
-                }
-                let dims: Vec<Dimensions> = self.mmcs
-                    .get_matrices(*data)
-                    .iter()
-                    .map(|m| {
+        // Other rounds: read dimensions directly from saved LDEs (no restore needed).
+        let round_dims: Vec<Vec<Dimensions>> = saved_ldes
+            .iter()
+            .map(|saved| {
+                match saved {
+                    Some(ldes) => ldes.iter().map(|m| {
                         let d = m.dimensions();
                         global_max_height = global_max_height.max(d.height);
                         global_max_width = global_max_width.max(d.width);
                         d
-                    })
-                    .collect();
-                if needs_restore {
-                    *saved = Some(data.take_leaves_rm());
+                    }).collect(),
+                    None => {
+                        // LDEs not saved (already in prover data) — shouldn't happen
+                        // in the current call pattern, but handle gracefully.
+                        vec![]
+                    }
                 }
-                dims
             })
             .collect();
 
@@ -1230,7 +1225,8 @@ where
             reduce_mats!(mats, preprocessed_points, all_opened_values[0]);
         }
 
-        // 2b: Main/perm/quotient rounds — restore and keep loaded for query phase.
+        // 2b: Main/perm/quotient rounds — restore one at a time, reduce, take back.
+        // This keeps at most 1 round's LDE in memory during reduction (vs all 3 before).
         for (ri, (data, points)) in rounds.iter_mut().enumerate() {
             if let Some(ldes) = saved_ldes[ri].take() {
                 data.restore_leaves_rm(ldes);
@@ -1239,7 +1235,11 @@ where
             let mats: Vec<_> = self.mmcs.get_matrices(*data)
                 .into_iter().map(|m| m.as_view()).collect_vec();
             reduce_mats!(mats, points, all_opened_values[ri + 1]);
-            // Keep LDEs loaded for query phase.
+
+            // Take LDE back — only 1 round in memory at a time during reduction.
+            if data.has_leaves_rm() {
+                saved_ldes[ri] = Some(data.take_leaves_rm());
+            }
         }
 
         // FRI prove.
@@ -1264,8 +1264,12 @@ where
             }
         }
 
-        // 3b: Main/perm/quotient round queries.
-        for (data, _) in rounds.iter_mut() {
+        // 3b: Main/perm/quotient round queries — restore one at a time.
+        for (ri, (data, _)) in rounds.iter_mut().enumerate() {
+            if let Some(ldes) = saved_ldes[ri].take() {
+                data.restore_leaves_rm(ldes);
+            }
+
             let log_max_height = log2_strict_usize(self.mmcs.get_max_height(*data));
             let bits_reduced = log_global_max_height - log_max_height;
             for (qi, &index) in query_indices.iter().enumerate() {
@@ -1273,6 +1277,11 @@ where
                 let (opened_values, opening_proof) =
                     self.mmcs.open_batch(reduced_index, *data);
                 all_query_openings[qi].push(BatchOpening { opened_values, opening_proof });
+            }
+
+            // Take LDE back — only 1 round in memory at a time during queries.
+            if data.has_leaves_rm() {
+                saved_ldes[ri] = Some(data.take_leaves_rm());
             }
         }
 
