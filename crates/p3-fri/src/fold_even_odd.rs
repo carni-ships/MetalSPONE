@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 
 use itertools::Itertools;
 use p3_field::TwoAdicField;
+use p3_matrix::Matrix;
 use p3_maybe_rayon::prelude::*;
 use p3_util::{log2_strict_usize, reverse_slice_index_bits};
 use tracing::instrument;
@@ -63,6 +64,38 @@ pub fn fold_even_odd<F: TwoAdicField>(mut poly: Vec<F>, beta: F) -> Vec<F> {
         });
     poly.truncate(half_len);
     poly
+}
+
+/// Fold from a width-2 matrix reference (committed data) without cloning.
+///
+/// Same computation as `fold_even_odd`, but reads even/odd pairs from the
+/// committed matrix via `get_matrices()` instead of requiring an owned Vec.
+/// Allocates only the (half-sized) output — avoids the full-size clone
+/// needed when `commit_matrix` consumes the original Vec.
+#[instrument(skip_all, level = "debug")]
+pub fn fold_from_committed<F: TwoAdicField, M: Matrix<F> + Sync>(mat: &M, beta: F) -> Vec<F> {
+    debug_assert_eq!(mat.width(), 2);
+    let half_len = mat.height();
+    let log_half_len = log2_strict_usize(half_len);
+    let g_inv = F::two_adic_generator(log_half_len + 1).inverse();
+    let one_half = F::two().inverse();
+    let half_beta = beta * one_half;
+
+    let mut powers = g_inv
+        .shifted_powers(half_beta)
+        .take(half_len)
+        .collect_vec();
+    reverse_slice_index_bits(&mut powers);
+
+    powers
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, power)| {
+            let r0 = mat.get(i, 0);
+            let r1 = mat.get(i, 1);
+            one_half * (r0 + r1) + power * (r0 - r1)
+        })
+        .collect()
 }
 
 #[cfg(test)]

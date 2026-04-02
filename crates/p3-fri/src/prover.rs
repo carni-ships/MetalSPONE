@@ -9,7 +9,7 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_maybe_rayon::prelude::*;
 use tracing::{info_span, instrument};
 
-use crate::fold_even_odd::fold_even_odd;
+use crate::fold_even_odd::{fold_even_odd, fold_from_committed};
 use crate::{CommitPhaseProofStep, FriConfig, FriProof, QueryProof};
 
 #[instrument(name = "FRI prover", skip_all)]
@@ -105,14 +105,20 @@ where
     let mut commits = vec![];
     let mut data = vec![];
     for log_folded_height in (config.log_blowup..log_max_height).rev() {
-        let leaves = RowMajorMatrix::new(current.clone(), 2);
+        // Give current to commit_matrix (no clone). Read back from ProverData for folding.
+        let leaves = RowMajorMatrix::new(current, 2);
         let (commit, prover_data) = config.mmcs.commit_matrix(leaves);
         challenger.observe(commit.clone());
         commits.push(commit);
-        data.push(prover_data);
 
         let beta: EF = challenger.sample_ext_element();
-        current = fold_even_odd(current, beta);
+
+        // Fold from committed data — avoids cloning the full Vec before commit.
+        let mats = config.mmcs.get_matrices(&prover_data);
+        debug_assert_eq!(mats.len(), 1);
+        current = fold_from_committed(mats[0], beta);
+
+        data.push(prover_data);
 
         if let Some(v) = &input[log_folded_height] {
             current.iter_mut().zip_eq(v).for_each(|(c, v)| *c += *v);
