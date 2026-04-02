@@ -486,22 +486,48 @@ where
                     .map(|row| alpha_reducer.reduce_base(row))
                     .collect();
 
-                for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
-                    let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-                    let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
+                if points_for_mat.len() == 2 {
+                    // Fused 2-point accumulation: iterate over reduced_opening once
+                    // instead of twice, halving cache misses on the large output vector.
+                    let alpha_offset0 = alpha.exp_u64(num_reduced[log_height] as u64);
+                    let y0 = alpha_reducer.reduce_ext(&openings_for_mat[0]);
+                    let inv0 = inv_denoms.get(&points_for_mat[0]).unwrap();
 
-                    let raw_inv_denoms = inv_denoms.get(&point).unwrap();
+                    num_reduced[log_height] += mat.width();
+
+                    let alpha_offset1 = alpha.exp_u64(num_reduced[log_height] as u64);
+                    let y1 = alpha_reducer.reduce_ext(&openings_for_mat[1]);
+                    let inv1 = inv_denoms.get(&points_for_mat[1]).unwrap();
+
+                    num_reduced[log_height] += mat.width();
 
                     reduced_opening_for_log_height
                         .par_iter_mut()
                         .zip(row_sums.par_iter())
-                        .zip(raw_inv_denoms[..mat.height()].par_iter())
-                        .for_each(|((reduced_opening, &row_sum), &inv_denom)| {
-                            *reduced_opening +=
-                                (inv_denom * alpha_pow_offset) * (row_sum - sum_alpha_pows_times_y);
+                        .zip(inv0[..mat.height()].par_iter())
+                        .zip(inv1[..mat.height()].par_iter())
+                        .for_each(|(((reduced, &row_sum), &d0), &d1)| {
+                            *reduced += (d0 * alpha_offset0) * (row_sum - y0)
+                                      + (d1 * alpha_offset1) * (row_sum - y1);
                         });
+                } else {
+                    for (&point, openings) in points_for_mat.iter().zip(openings_for_mat) {
+                        let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
+                        let sum_alpha_pows_times_y = alpha_reducer.reduce_ext(openings);
 
-                    num_reduced[log_height] += mat.width();
+                        let raw_inv_denoms = inv_denoms.get(&point).unwrap();
+
+                        reduced_opening_for_log_height
+                            .par_iter_mut()
+                            .zip(row_sums.par_iter())
+                            .zip(raw_inv_denoms[..mat.height()].par_iter())
+                            .for_each(|((reduced_opening, &row_sum), &inv_denom)| {
+                                *reduced_opening +=
+                                    (inv_denom * alpha_pow_offset) * (row_sum - sum_alpha_pows_times_y);
+                            });
+
+                        num_reduced[log_height] += mat.width();
+                    }
                 }
             }
         }
