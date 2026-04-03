@@ -226,6 +226,74 @@ mod gpu_interp {
 
         Some(results)
     }
+
+    /// Batched GPU row-wise alpha reduction for all matrices in a round.
+    ///
+    /// Computes row_sums[row] = sum_col(alpha^col * mat[row][col]) for each matrix,
+    /// all in a single GPU command buffer.
+    ///
+    /// matrices: (raw data, width) per matrix — FULL LDE height
+    /// alpha_powers: [alpha^0, alpha^1, ..., alpha^(max_width-1)] as EF elements
+    /// Returns None if GPU unavailable, Some(row_sums per matrix) otherwise.
+    pub fn try_gpu_row_reduce_batched<F2, EF2>(
+        matrices: &[(&[F2], usize)],  // (raw data, width)
+        alpha_powers: &[EF2],          // precomputed alpha^i
+        height: usize,
+    ) -> Option<Vec<Vec<EF2>>>
+    where
+        F2: TwoAdicField,
+        EF2: ExtensionField<F2> + TwoAdicField,
+    {
+        if core::mem::size_of::<F2>() != 4 || core::mem::size_of::<EF2>() != 16 {
+            return None;
+        }
+        if !gpu_enabled() || matrices.is_empty() {
+            return None;
+        }
+
+        let total_elements: usize = matrices.iter().map(|(_, w)| height * w).sum();
+        if total_elements < 262144 {
+            return None;
+        }
+
+        use std::sync::OnceLock;
+        static STATE: OnceLock<metal_ntt::device::MetalState> = OnceLock::new();
+        let state = STATE.get_or_init(metal_ntt::device::MetalState::new);
+
+        // Build per-matrix descriptors with their slice of alpha powers.
+        let mat_descs: Vec<(*const u32, usize, usize, &[u32])> = matrices.iter()
+            .map(|&(data, width)| {
+                let ptr = data.as_ptr() as *const u32;
+                let byte_len = data.len() * core::mem::size_of::<F2>();
+                let alpha_u32: &[u32] = unsafe {
+                    core::slice::from_raw_parts(
+                        alpha_powers.as_ptr() as *const u32,
+                        width * 4,  // width elements × 4 components
+                    )
+                };
+                (ptr, byte_len, width, alpha_u32)
+            })
+            .collect();
+
+        let raw_results = metal_ntt::dot_product::gpu_row_reduce_alpha_batched(
+            state,
+            &mat_descs,
+            height,
+        );
+
+        // Reinterpret u32 results as extension field vectors.
+        let results: Vec<Vec<EF2>> = raw_results
+            .into_iter()
+            .map(|r_u32| {
+                unsafe {
+                    let mut v = core::mem::ManuallyDrop::new(r_u32);
+                    Vec::from_raw_parts(v.as_mut_ptr() as *mut EF2, height, v.capacity() / 4)
+                }
+            })
+            .collect();
+
+        Some(results)
+    }
 }
 
 use crate::verifier::{self, FriError};
@@ -1307,19 +1375,47 @@ where
         let mut reduced_openings: [Option<Vec<Challenge>>; 32] = core::array::from_fn(|_| None);
 
         // Phase 2: Row reduction with 2-point fusion.
+        // Tries GPU batched row reduction for row_sums, falls back to CPU.
         macro_rules! reduce_mats {
             ($mats:expr, $points:expr, $opened_values:expr) => {
+                let __rm_mats = &$mats;
+                let __rm_points = &$points;
+                let __rm_opened = &$opened_values;
+
+                // Try GPU batched row reduction (all row_sums in one dispatch).
+                #[cfg(target_os = "macos")]
+                let __gpu_row_sums: Option<Vec<Vec<Challenge>>> = 'gpu_reduce: {
+                    if __rm_mats.is_empty() { break 'gpu_reduce None; }
+                    let h0 = __rm_mats[0].height();
+                    if !__rm_mats.iter().all(|m| m.height() == h0) { break 'gpu_reduce None; }
+
+                    let mat_data: Vec<(&[Val], usize)> = __rm_mats.iter().map(|mat| {
+                        (mat.values, mat.width())
+                    }).collect();
+
+                    gpu_interp::try_gpu_row_reduce_batched(
+                        &mat_data, &alpha_reducer.powers, h0,
+                    )
+                };
+                #[cfg(not(target_os = "macos"))]
+                let __gpu_row_sums: Option<Vec<Vec<Challenge>>> = None;
+
+                let mut __gpu_iter = __gpu_row_sums.map(|v| v.into_iter());
+
                 for (mat, points_for_mat, openings_for_mat) in
-                    izip!($mats.iter(), $points.iter(), $opened_values.iter())
+                    izip!(__rm_mats.iter(), __rm_points.iter(), __rm_opened.iter())
                 {
                     let log_height = log2_strict_usize(mat.height());
                     let reduced_opening_for_log_height = reduced_openings[log_height]
                         .get_or_insert_with(|| vec![Challenge::zero(); mat.height()]);
 
-                    let row_sums: Vec<Challenge> = mat
-                        .par_row_slices()
-                        .map(|row| alpha_reducer.reduce_base(row))
-                        .collect();
+                    let row_sums: Vec<Challenge> = match &mut __gpu_iter {
+                        Some(iter) => iter.next().unwrap(),
+                        None => mat
+                            .par_row_slices()
+                            .map(|row| alpha_reducer.reduce_base(row))
+                            .collect(),
+                    };
 
                     if points_for_mat.len() == 2 {
                         let alpha_offset0 = alpha.exp_u64(num_reduced[log_height] as u64);
