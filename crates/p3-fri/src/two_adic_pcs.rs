@@ -928,6 +928,31 @@ where
         self.fri.log_blowup
     }
 
+    /// Get raw LDE data slices for all committed matrices (bit-reversed row order).
+    ///
+    /// Returns `(data_slice, width)` for each matrix. The data is in bit-reversed
+    /// row order as stored in the MMCS. Only the first `domain_size` rows of each
+    /// matrix are returned (via split_rows).
+    ///
+    /// Used by GPU quotient evaluation to avoid materializing quotient-domain traces.
+    pub fn get_lde_slices<'a>(
+        &self,
+        prover_data: &'a <InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>,
+        domain_sizes: &[usize],
+    ) -> Vec<(&'a [Val], usize)>
+    where
+        InputMmcs: Mmcs<Val>,
+    {
+        let mats = self.mmcs.get_matrices(prover_data);
+        mats.into_iter()
+            .zip(domain_sizes)
+            .map(|(lde, &ds)| {
+                let view = lde.split_rows(ds).0;
+                (view.values, view.width)
+            })
+            .collect()
+    }
+
     /// Memory-efficient version of `open` using pre-cached LDE leaves.
     ///
     /// For rounds where `saved_ldes[i]` is `Some(ldes)`, the LDE leaves were taken from the

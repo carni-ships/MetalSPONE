@@ -503,13 +503,48 @@ where
                                 data.public_values.len(),
                             );
 
-                        // Phase 1: Evaluate traces and prepare GPU dispatches.
-                        // GPU-eligible chips get Metal buffers; others are queued for CPU.
+                        // Phase 1: Prepare GPU dispatches using raw LDE data (bitrev path).
+                        //
+                        // Instead of materializing quotient-domain evaluations (hundreds of
+                        // MB per large chip), we pass raw LDE pointers to the GPU kernel
+                        // which does bit-reversal indexing internally.
+                        //
+                        // The LDE data lives in the MMCS prover_data (main_data,
+                        // permutation_data, pk.data), which outlives the GPU dispatch.
                         let mut gpu_dispatches: Vec<(
                             usize,
                             metal_ntt::constraints::ChipDispatch,
                         )> = Vec::new();
                         let mut cpu_indices: Vec<usize> = Vec::new();
+
+                        // Get quotient domain sizes for all chips.
+                        let quot_sizes: Vec<usize> = quotient_domains
+                            .as_slice()
+                            .iter()
+                            .map(|d| d.size())
+                            .collect();
+
+                        // Get raw LDE slices (bit-reversed row order) directly
+                        // from MMCS prover data — no materialization.
+                        let main_lde_slices =
+                            crate::gpu_quotient::get_lde_slices_from_pcs::<SC>(
+                                pcs, &data.main_data, &quot_sizes,
+                            );
+                        let perm_lde_slices =
+                            crate::gpu_quotient::get_lde_slices_from_pcs::<SC>(
+                                pcs, &permutation_data, &quot_sizes,
+                            );
+                        // Prep LDE: map chip ordering to quotient sizes.
+                        let mut prep_sizes = vec![0usize; pk.chip_ordering.len()];
+                        for (i, _) in quotient_domains.as_slice().iter().enumerate() {
+                            if let Some(&index) = pk.chip_ordering.get(&chips[i].name()) {
+                                prep_sizes[index] = quot_sizes[i];
+                            }
+                        }
+                        let prep_lde_slices =
+                            crate::gpu_quotient::get_lde_slices_from_pcs::<SC>(
+                                pcs, &pk.data, &prep_sizes,
+                            );
 
                         for (i, quotient_domain) in
                             quotient_domains.as_slice().iter().enumerate()
@@ -534,42 +569,16 @@ where
                                 as *const SepticDigest<Val<SC>>
                                 as *const SepticDigest<p3_baby_bear::BabyBear>);
 
-                            // Evaluate traces on quotient domain
-                            let prep_trace: Option<
-                                p3_matrix::dense::RowMajorMatrix<p3_baby_bear::BabyBear>,
-                            > = pk.chip_ordering.get(&chips[i].name()).map(
-                                |&index| {
-                                    std::mem::transmute(
-                                        pcs.get_evaluations_on_domain(
-                                                &pk.data,
-                                                index,
-                                                *quotient_domain,
-                                            ).to_row_major_matrix(),
-                                    )
-                                },
-                            );
-                            let main_trace: p3_matrix::dense::RowMajorMatrix<
-                                p3_baby_bear::BabyBear,
-                            > = std::mem::transmute(
-                                pcs.get_evaluations_on_domain(
-                                    &data.main_data,
-                                    i,
-                                    *quotient_domain,
-                                ).to_row_major_matrix(),
-                            );
-                            let perm_trace: p3_matrix::dense::RowMajorMatrix<
-                                p3_baby_bear::BabyBear,
-                            > = std::mem::transmute(
-                                pcs.get_evaluations_on_domain(
-                                    &permutation_data,
-                                    i,
-                                    *quotient_domain,
-                                ).to_row_major_matrix(),
-                            );
+                            let (main_lde_data, main_lde_w) = main_lde_slices[i];
+                            let (perm_lde_data, perm_lde_w) = perm_lde_slices[i];
+                            let prep_lde_info: Option<(&[p3_baby_bear::BabyBear], usize)> =
+                                pk.chip_ordering.get(&chips[i].name()).map(|&index| {
+                                    prep_lde_slices[index]
+                                });
 
-                            // Try to prepare GPU dispatch
+                            // Try bitrev dispatch (avoids materialization).
                             let dispatch =
-                                crate::gpu_quotient::prepare_quotient_dispatch(
+                                crate::gpu_quotient::prepare_quotient_dispatch_bitrev(
                                     bb_chip,
                                     chips[i].preprocessed_width(),
                                     <_ as p3_air::BaseAir<Val<SC>>>::width(chips[i]),
@@ -578,9 +587,12 @@ where
                                     bb_global_cum_sum,
                                     bb_trace_domain,
                                     bb_quotient_domain,
-                                    &prep_trace,
-                                    &main_trace,
-                                    &perm_trace,
+                                    main_lde_data,
+                                    main_lde_w,
+                                    prep_lde_info.map(|(data, _)| data),
+                                    prep_lde_info.map_or(0, |(_, w)| w),
+                                    perm_lde_data,
+                                    perm_lde_w,
                                     bb_perm_challenges,
                                     bb_alpha,
                                     bb_public_values,
@@ -591,7 +603,6 @@ where
                                 Some(d) => gpu_dispatches.push((i, d)),
                                 None => cpu_indices.push(i),
                             }
-                            // Traces are dropped here; Metal buffers hold copies
                         }
 
                         tracing::info!(
@@ -677,6 +688,11 @@ where
                                     gpu_vals,
                                 ));
                         }
+
+                        // gpu_dispatches dropped here — safe because GPU has
+                        // completed and results are read out. LDE data in
+                        // MMCS prover_data outlives this scope.
+                        drop(gpu_dispatches);
 
                         return results.into_iter().map(|r| r.unwrap()).collect();
                     }
