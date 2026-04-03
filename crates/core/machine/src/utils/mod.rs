@@ -8,6 +8,7 @@ pub mod uni_stark;
 pub use logger::*;
 use p3_field::Field;
 pub use prove::*;
+use sp1_core_executor::events::{ByteLookupEvent, ByteRecord};
 use sp1_curves::params::Limbs;
 pub use span::*;
 pub use test::*;
@@ -207,4 +208,20 @@ pub fn zeroed_f_vec<F: Field>(len: usize) -> Vec<F> {
 
     let vec = vec![0u32; len];
     unsafe { std::mem::transmute::<Vec<u32>, Vec<F>>(vec) }
+}
+
+/// A no-op [`ByteRecord`] that discards all byte lookup events.
+///
+/// Used in `generate_trace` where byte lookups are collected separately via
+/// `generate_dependencies`. Avoids allocating a throwaway `Vec` per row.
+pub struct NullByteRecord;
+
+impl ByteRecord for NullByteRecord {
+    #[inline(always)]
+    fn add_byte_lookup_event(&mut self, _: ByteLookupEvent) {}
+    fn add_byte_lookup_events_from_maps(
+        &mut self,
+        _: Vec<&hashbrown::HashMap<ByteLookupEvent, usize>>,
+    ) {
+    }
 }

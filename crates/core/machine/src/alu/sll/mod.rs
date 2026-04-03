@@ -49,7 +49,7 @@ use sp1_derive::AlignedBorrow;
 use sp1_primitives::consts::WORD_SIZE;
 use sp1_stark::{air::MachineAir, Word};
 
-use crate::{air::SP1CoreAirBuilder, utils::pad_rows_fixed};
+use crate::{air::SP1CoreAirBuilder, utils::{pad_rows_fixed, NullByteRecord}};
 
 /// The number of main trace columns for `ShiftLeft`.
 pub const NUM_SHIFT_LEFT_COLS: usize = size_of::<ShiftLeftCols<u8>>();
@@ -121,8 +121,7 @@ impl<F: PrimeField32> MachineAir<F> for ShiftLeft {
         for event in shift_left_events.iter() {
             let mut row = [F::zero(); NUM_SHIFT_LEFT_COLS];
             let cols: &mut ShiftLeftCols<F> = row.as_mut_slice().borrow_mut();
-            let mut blu = Vec::new();
-            self.event_to_row(event, cols, &mut blu);
+            self.event_to_row(event, cols, &mut NullByteRecord);
             rows.push(row);
         }
 

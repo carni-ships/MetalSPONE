@@ -51,7 +51,7 @@ use sp1_stark::{air::MachineAir, Word};
 use crate::{
     air::SP1CoreAirBuilder,
     alu::mul::utils::get_msb,
-    utils::{next_power_of_two, zeroed_f_vec},
+    utils::{next_power_of_two, zeroed_f_vec, NullByteRecord},
 };
 
 /// The number of main trace columns for `MulChip`.
@@ -145,9 +145,8 @@ impl<F: PrimeField32> MachineAir<F> for MulChip {
                     let cols: &mut MulCols<F> = row.borrow_mut();
 
                     if idx < nb_rows {
-                        let mut byte_lookup_events = Vec::new();
                         let event = &input.mul_events[idx];
-                        self.event_to_row(event, cols, &mut byte_lookup_events);
+                        self.event_to_row(event, cols, &mut NullByteRecord);
                     }
                 });
             },

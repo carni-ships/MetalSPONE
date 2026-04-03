@@ -21,7 +21,7 @@ use sp1_stark::{
 
 use crate::{
     operations::AddOperation,
-    utils::{next_power_of_two, zeroed_f_vec},
+    utils::{next_power_of_two, zeroed_f_vec, NullByteRecord},
 };
 
 /// The number of main trace columns for `AddSubChip`.
@@ -100,9 +100,8 @@ impl<F: PrimeField32> MachineAir<F> for AddSubChip {
                     let cols: &mut AddSubCols<F> = row.borrow_mut();
 
                     if idx < merged_events.len() {
-                        let mut byte_lookup_events = Vec::new();
                         let event = &merged_events[idx];
-                        self.event_to_row(event, cols, &mut byte_lookup_events);
+                        self.event_to_row(event, cols, &mut NullByteRecord);
                     }
                 });
             },

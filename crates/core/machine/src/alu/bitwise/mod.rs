@@ -19,7 +19,7 @@ use sp1_stark::{
     Word,
 };
 
-use crate::utils::pad_rows_fixed;
+use crate::utils::{pad_rows_fixed, NullByteRecord};
 
 /// The number of main trace columns for `BitwiseChip`.
 pub const NUM_BITWISE_COLS: usize = size_of::<BitwiseCols<u8>>();
@@ -77,8 +77,7 @@ impl<F: PrimeField32> MachineAir<F> for BitwiseChip {
             .map(|event| {
                 let mut row = [F::zero(); NUM_BITWISE_COLS];
                 let cols: &mut BitwiseCols<F> = row.as_mut_slice().borrow_mut();
-                let mut blu = Vec::new();
-                self.event_to_row(event, cols, &mut blu);
+                self.event_to_row(event, cols, &mut NullByteRecord);
                 row
             })
             .collect::<Vec<_>>();

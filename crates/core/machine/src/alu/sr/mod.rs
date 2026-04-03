@@ -65,7 +65,7 @@ use crate::{
     air::SP1CoreAirBuilder,
     alu::sr::utils::{nb_bits_to_shift, nb_bytes_to_shift},
     bytes::utils::shr_carry,
-    utils::{next_power_of_two, zeroed_f_vec},
+    utils::{next_power_of_two, zeroed_f_vec, NullByteRecord},
 };
 
 /// The number of main trace columns for `ShiftRightChip`.
@@ -162,9 +162,8 @@ impl<F: PrimeField32> MachineAir<F> for ShiftRightChip {
                     let cols: &mut ShiftRightCols<F> = row.borrow_mut();
 
                     if idx < nb_rows {
-                        let mut byte_lookup_events = Vec::new();
                         let event = &input.shift_right_events[idx];
-                        self.event_to_row(event, cols, &mut byte_lookup_events);
+                        self.event_to_row(event, cols, &mut NullByteRecord);
                     } else {
                         cols.shift_by_n_bits[0] = F::one();
                         cols.shift_by_n_bytes[0] = F::one();

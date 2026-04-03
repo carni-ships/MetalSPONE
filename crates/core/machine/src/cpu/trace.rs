@@ -15,21 +15,7 @@ use sp1_stark::air::MachineAir;
 use tracing::instrument;
 
 use super::{columns::NUM_CPU_COLS, CpuChip};
-use crate::{cpu::columns::CpuCols, memory::MemoryCols, utils::zeroed_f_vec};
-
-/// A no-op ByteRecord that discards all byte lookup events.
-/// Used by `generate_trace` where byte lookups are collected separately via `generate_dependencies`.
-struct NullByteRecord;
-
-impl ByteRecord for NullByteRecord {
-    #[inline(always)]
-    fn add_byte_lookup_event(&mut self, _: ByteLookupEvent) {}
-    fn add_byte_lookup_events_from_maps(
-        &mut self,
-        _: Vec<&HashMap<ByteLookupEvent, usize>>,
-    ) {
-    }
-}
+use crate::{cpu::columns::CpuCols, memory::MemoryCols, utils::{zeroed_f_vec, NullByteRecord}};
 
 impl<F: PrimeField32> MachineAir<F> for CpuChip {
     type Record = ExecutionRecord;
