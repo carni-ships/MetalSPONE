@@ -125,6 +125,107 @@ mod gpu_interp {
 
         Some(result)
     }
+
+    /// Batched GPU interpolation: computes 2-point interpolation for ALL matrices
+    /// in a single GPU command buffer. All matrices must have the same height.
+    ///
+    /// Returns None if GPU is unavailable or types are wrong.
+    /// Returns Some(results) where results[i] = (ys0, ys1) for matrix i.
+    pub fn try_gpu_interpolate_batched_2point<F2, EF2>(
+        matrices: &[(&[F2], usize)],  // (raw data, width) per matrix
+        height: usize,
+        shift: F2,
+        point0: EF2,
+        diff_invs0: &[EF2],
+        point1: EF2,
+        diff_invs1: &[EF2],
+    ) -> Option<Vec<(Vec<EF2>, Vec<EF2>)>>
+    where
+        F2: TwoAdicField,
+        EF2: ExtensionField<F2> + TwoAdicField,
+    {
+        if core::mem::size_of::<F2>() != 4 || core::mem::size_of::<EF2>() != 16 {
+            return None;
+        }
+        if !gpu_enabled() || matrices.is_empty() {
+            return None;
+        }
+
+        // Compute total elements across all matrices.
+        let total_elements: usize = matrices.iter().map(|(_, w)| height * w).sum();
+        if total_elements < 262144 {
+            return None; // Too small for GPU to win.
+        }
+
+        use std::sync::OnceLock;
+        static STATE: OnceLock<metal_ntt::device::MetalState> = OnceLock::new();
+        let state = STATE.get_or_init(metal_ntt::device::MetalState::new);
+        let log_h = log2_strict_usize(height);
+
+        // Compute shared col_scale vectors (same for all matrices in this round).
+        let g = F2::two_adic_generator(log_h);
+        let col_scale0: Vec<EF2> = g.powers()
+            .zip(diff_invs0.iter())
+            .map(|(sg, &di)| di * sg)
+            .collect();
+        let col_scale1: Vec<EF2> = g.powers()
+            .zip(diff_invs1.iter())
+            .map(|(sg, &di)| di * sg)
+            .collect();
+
+        let scale0_u32: &[u32] = unsafe {
+            core::slice::from_raw_parts(col_scale0.as_ptr() as *const u32, col_scale0.len() * 4)
+        };
+        let scale1_u32: &[u32] = unsafe {
+            core::slice::from_raw_parts(col_scale1.as_ptr() as *const u32, col_scale1.len() * 4)
+        };
+
+        // Build matrix descriptors for batched dispatch.
+        let mat_descs: Vec<(*const u32, usize, usize)> = matrices.iter()
+            .map(|&(data, width)| {
+                let ptr = data.as_ptr() as *const u32;
+                let byte_len = data.len() * core::mem::size_of::<F2>();
+                (ptr, byte_len, width)
+            })
+            .collect();
+
+        let raw_results = metal_ntt::dot_product::gpu_dot_product_2point_batched(
+            state,
+            &mat_descs,
+            scale0_u32,
+            scale1_u32,
+            height,
+        );
+
+        // Apply zerofier scaling and reinterpret as extension field.
+        let z0 = two_adic_coset_zerofier::<EF2>(log_h, EF2::from_base(shift), point0);
+        let z1 = two_adic_coset_zerofier::<EF2>(log_h, EF2::from_base(shift), point1);
+        let denominator = F2::from_canonical_usize(height) * shift.exp_u64(height as u64 - 1);
+        let denom_inv = denominator.inverse();
+        let scale0_final = z0 * denom_inv;
+        let scale1_final = z1 * denom_inv;
+
+        let results: Vec<(Vec<EF2>, Vec<EF2>)> = raw_results
+            .into_iter()
+            .zip(matrices.iter())
+            .map(|((r0_u32, r1_u32), &(_, width))| {
+                // Reinterpret u32 results as extension field elements.
+                let mut ys0: Vec<EF2> = unsafe {
+                    let mut v = core::mem::ManuallyDrop::new(r0_u32);
+                    Vec::from_raw_parts(v.as_mut_ptr() as *mut EF2, width, v.capacity() / 4)
+                };
+                let mut ys1: Vec<EF2> = unsafe {
+                    let mut v = core::mem::ManuallyDrop::new(r1_u32);
+                    Vec::from_raw_parts(v.as_mut_ptr() as *mut EF2, width, v.capacity() / 4)
+                };
+                for y in ys0.iter_mut() { *y = *y * scale0_final; }
+                for y in ys1.iter_mut() { *y = *y * scale1_final; }
+                (ys0, ys1)
+            })
+            .collect();
+
+        Some(results)
+    }
 }
 
 use crate::verifier::{self, FriError};
@@ -1079,39 +1180,83 @@ where
 
         let log_blowup = self.fri.log_blowup;
 
-        // Interpolation helper: given matrices and points, compute opened values
-        // with 2-point fusion when possible.
+        // Interpolation helper: given matrices and points, compute opened values.
+        // Tries GPU batched 2-point interpolation first, falls back to CPU.
         macro_rules! interpolate_mats {
             ($mats:expr, $points:expr) => {{
-                $mats.par_iter()
-                    .zip($points.par_iter())
-                    .map(|(mat, points_for_mat)| {
+                let __mats = &$mats;
+                let __points = &$points;
+
+                // Try GPU batched interpolation (macOS only, METAL_DFT=1).
+                #[cfg(target_os = "macos")]
+                let __gpu_result: Option<Vec<Vec<Vec<Challenge>>>> = 'gpu: {
+                    if __mats.is_empty() { break 'gpu None; }
+                    // All must open at exactly 2 points with same point pair.
+                    if !__points.iter().all(|p| p.len() == 2) { break 'gpu None; }
+                    let pt0 = __points[0][0];
+                    let pt1 = __points[0][1];
+                    if !__points.iter().all(|p| p[0] == pt0 && p[1] == pt1) { break 'gpu None; }
+                    // All matrices must have the same LDE height.
+                    let h0 = __mats[0].height() >> log_blowup;
+                    if !__mats.iter().all(|m| (m.height() >> log_blowup) == h0) { break 'gpu None; }
+
+                    let log_h = log2_strict_usize(h0);
+                    let full_inv0 = match inv_denoms.get(&pt0) { Some(v) => v, None => break 'gpu None };
+                    let full_inv1 = match inv_denoms.get(&pt1) { Some(v) => v, None => break 'gpu None };
+                    let di0: Vec<Challenge> = (0..h0).map(|i| -full_inv0[reverse_bits_len(i, log_h)]).collect();
+                    let di1: Vec<Challenge> = (0..h0).map(|i| -full_inv1[reverse_bits_len(i, log_h)]).collect();
+
+                    // Collect raw data slices (first h rows of each matrix in physical order).
+                    let mat_data: Vec<(&[Val], usize)> = __mats.iter().map(|mat| {
                         let h = mat.height() >> log_blowup;
-                        let log_h = log2_strict_usize(h);
-                        let (low_coset, _) = mat.split_rows(h);
-                        let brp_view = BitReversalPerm::new_view(low_coset);
-                        let make_diff_invs = |point: Challenge| -> Vec<Challenge> {
-                            let full_inv = inv_denoms.get(&point).unwrap();
-                            (0..h).map(|i| -full_inv[reverse_bits_len(i, log_h)]).collect()
-                        };
-                        if points_for_mat.len() == 2 {
-                            let di0 = make_diff_invs(points_for_mat[0]);
-                            let di1 = make_diff_invs(points_for_mat[1]);
-                            let (ys0, ys1) = interpolate_coset_precomputed_2point(
-                                &brp_view, Val::generator(),
-                                points_for_mat[0], &di0,
-                                points_for_mat[1], &di1,
-                            );
-                            vec![ys0, ys1]
-                        } else {
-                            points_for_mat.iter().map(|&point| {
-                                let diff_invs = make_diff_invs(point);
-                                interpolate_coset_precomputed(
-                                    &brp_view, Val::generator(), point, &diff_invs,
-                                )
-                            }).collect_vec()
-                        }
-                    }).collect::<Vec<_>>()
+                        let w = mat.width();
+                        let (low, _) = mat.split_rows(h);
+                        (low.values, w)
+                    }).collect();
+
+                    match gpu_interp::try_gpu_interpolate_batched_2point(
+                        &mat_data, h0, Val::generator(), pt0, &di0, pt1, &di1,
+                    ) {
+                        Some(results) => Some(results.into_iter().map(|(ys0, ys1)| vec![ys0, ys1]).collect()),
+                        None => None,
+                    }
+                };
+
+                #[cfg(not(target_os = "macos"))]
+                let __gpu_result: Option<Vec<Vec<Vec<Challenge>>>> = None;
+
+                __gpu_result.unwrap_or_else(|| {
+                    // CPU fallback with per-matrix parallelism and 2-point fusion.
+                    __mats.par_iter()
+                        .zip(__points.par_iter())
+                        .map(|(mat, points_for_mat)| {
+                            let h = mat.height() >> log_blowup;
+                            let log_h = log2_strict_usize(h);
+                            let (low_coset, _) = mat.split_rows(h);
+                            let brp_view = BitReversalPerm::new_view(low_coset);
+                            let make_diff_invs = |point: Challenge| -> Vec<Challenge> {
+                                let full_inv = inv_denoms.get(&point).unwrap();
+                                (0..h).map(|i| -full_inv[reverse_bits_len(i, log_h)]).collect()
+                            };
+                            if points_for_mat.len() == 2 {
+                                let di0 = make_diff_invs(points_for_mat[0]);
+                                let di1 = make_diff_invs(points_for_mat[1]);
+                                let (ys0, ys1) = interpolate_coset_precomputed_2point(
+                                    &brp_view, Val::generator(),
+                                    points_for_mat[0], &di0,
+                                    points_for_mat[1], &di1,
+                                );
+                                vec![ys0, ys1]
+                            } else {
+                                points_for_mat.iter().map(|&point| {
+                                    let diff_invs = make_diff_invs(point);
+                                    interpolate_coset_precomputed(
+                                        &brp_view, Val::generator(), point, &diff_invs,
+                                    )
+                                }).collect_vec()
+                            }
+                        }).collect::<Vec<_>>()
+                })
             }};
         }
 
