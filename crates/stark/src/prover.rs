@@ -51,6 +51,89 @@ fn global_metal() -> &'static metal_ntt::device::MetalState {
     STATE.get_or_init(metal_ntt::device::MetalState::new)
 }
 
+/// Commit traces without cloning them.
+///
+/// On macOS with METAL_DFT=1, uses MetalDft::coset_lde_batch_multi_ref to do the DFT
+/// from borrowed trace matrices, then commits the resulting LDEs via the MMCS.
+/// This avoids cloning ~1.2GB of trace data that the trait-based `pcs.commit()` requires.
+///
+/// On non-macOS or when GPU DFT is not available, falls back to the standard clone path.
+fn commit_traces_borrowed<SC: StarkGenericConfig>(
+    pcs: &SC::Pcs,
+    named_traces: &[(String, RowMajorMatrix<Val<SC>>)],
+) -> (Com<SC>, PcsProverData<SC>) {
+    #[cfg(target_os = "macos")]
+    {
+        use p3_baby_bear::BabyBear;
+        use p3_field::TwoAdicField;
+        use p3_matrix::bitrev::BitReversableMatrix;
+
+        // Only use the borrowed path when Val = BabyBear (always true for SP1)
+        if std::mem::size_of::<Val<SC>>() == std::mem::size_of::<BabyBear>() {
+            // Get the concrete PCS to access log_blowup and commit_ldes
+            type InnerPcs = crate::bb31_poseidon2::InnerPcs;
+            let concrete_pcs: &InnerPcs = unsafe {
+                &*(pcs as *const SC::Pcs as *const InnerPcs)
+            };
+
+            let metal_dft = concrete_pcs.dft();
+            let log_blowup = concrete_pcs.log_blowup();
+
+            // Build ref inputs for the DFT (BabyBear types via pointer cast)
+            // Domain shift is always Val::one() for natural domains, so
+            // coset shift = generator() / one() = generator().
+            let coset_shift = BabyBear::generator();
+            let ref_inputs: Vec<(&RowMajorMatrix<BabyBear>, usize, BabyBear)> = named_traces
+                .iter()
+                .map(|(_, trace)| {
+                    let bb_trace: &RowMajorMatrix<BabyBear> = unsafe {
+                        &*(trace as *const RowMajorMatrix<Val<SC>>
+                            as *const RowMajorMatrix<BabyBear>)
+                    };
+                    (bb_trace, log_blowup, coset_shift)
+                })
+                .collect();
+
+            let t_dft = Instant::now();
+            let ldes: Vec<RowMajorMatrix<BabyBear>> = metal_dft
+                .coset_lde_batch_multi_ref(&ref_inputs)
+                .into_iter()
+                .map(|m| m.bit_reverse_rows().to_row_major_matrix())
+                .collect();
+            let dft_ms = t_dft.elapsed().as_secs_f64() * 1000.0;
+
+            let t_merkle = Instant::now();
+            let (commit, data) = concrete_pcs.commit_ldes(ldes);
+            let merkle_ms = t_merkle.elapsed().as_secs_f64() * 1000.0;
+            if dft_ms + merkle_ms > 100.0 {
+                tracing::info!(
+                    "commit_borrowed: dft={dft_ms:.0}ms merkle={merkle_ms:.0}ms total={:.0}ms",
+                    dft_ms + merkle_ms
+                );
+            }
+
+            // Transmute concrete types back to generic SC types
+            return unsafe {
+                let commit_sc: Com<SC> = std::mem::transmute_copy(&commit);
+                std::mem::forget(commit);
+                let data_sc: PcsProverData<SC> = std::ptr::read(&data as *const _ as *const _);
+                std::mem::forget(data);
+                (commit_sc, data_sc)
+            };
+        }
+    }
+
+    // Fallback: standard clone path
+    let domains_and_traces = named_traces
+        .iter()
+        .map(|(_, trace)| {
+            let domain = pcs.natural_domain_for_degree(trace.height());
+            (domain, trace.to_owned())
+        })
+        .collect::<Vec<_>>();
+    pcs.commit(domains_and_traces)
+}
+
 /// An algorithmic & hardware independent prover implementation for any [`MachineAir`].
 pub trait MachineProver<SC: StarkGenericConfig, A: MachineAir<SC::Val>>:
     'static + Send + Sync
@@ -281,17 +364,10 @@ where
 
         let pcs = self.config().pcs();
 
-        let domains_and_traces = named_traces
-            .iter()
-            .map(|(_, trace)| {
-                let domain = pcs.natural_domain_for_degree(trace.height());
-                (domain, trace.to_owned())
-            })
-            .collect::<Vec<_>>();
-
-        // Commit to the batch of traces.
+        // On macOS, use MetalDft::coset_lde_batch_multi_ref to do DFT from borrowed
+        // traces, then commit the LDEs directly. Avoids cloning ~1.2GB of trace data.
         let t_main_commit = std::time::Instant::now();
-        let (main_commit, main_data) = pcs.commit(domains_and_traces);
+        let (main_commit, main_data) = commit_traces_borrowed::<SC>(pcs, &named_traces);
         let main_commit_ms = t_main_commit.elapsed().as_secs_f64() * 1000.0;
         if main_commit_ms > 50.0 {
             tracing::info!("main_commit: {:.0}ms", main_commit_ms);

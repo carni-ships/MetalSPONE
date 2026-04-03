@@ -953,6 +953,18 @@ where
             .collect()
     }
 
+    /// Commit LDE matrices directly (bypasses DFT — caller has already computed LDEs).
+    ///
+    /// Used by the prover's borrowed-commit path where DFT is done externally
+    /// via MetalDft::coset_lde_batch_multi_ref to avoid cloning trace matrices.
+    pub fn commit_ldes(
+        &self,
+        ldes: Vec<RowMajorMatrix<Val>>,
+    ) -> (<InputMmcs as Mmcs<Val>>::Commitment, <InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>)
+    {
+        self.mmcs.commit(ldes)
+    }
+
     /// Memory-efficient version of `open` using pre-cached LDE leaves.
     ///
     /// For rounds where `saved_ldes[i]` is `Some(ldes)`, the LDE leaves were taken from the
