@@ -6,7 +6,7 @@ use p3_field::{PrimeField, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_maybe_rayon::prelude::{ParallelBridge, ParallelIterator, ParallelSlice};
 use sp1_core_executor::{
-    events::{ByteLookupEvent, ByteRecord, CpuEvent, MemoryRecordEnum},
+    events::{ByteLookupEvent, ByteRecord, CpuEvent, MemoryReadRecord, MemoryRecordEnum},
     syscalls::SyscallCode,
     ByteOpcode::{self, U16Range},
     ExecutionRecord, Instruction, Program,
@@ -16,6 +16,20 @@ use tracing::instrument;
 
 use super::{columns::NUM_CPU_COLS, CpuChip};
 use crate::{cpu::columns::CpuCols, memory::MemoryCols, utils::zeroed_f_vec};
+
+/// A no-op ByteRecord that discards all byte lookup events.
+/// Used by `generate_trace` where byte lookups are collected separately via `generate_dependencies`.
+struct NullByteRecord;
+
+impl ByteRecord for NullByteRecord {
+    #[inline(always)]
+    fn add_byte_lookup_event(&mut self, _: ByteLookupEvent) {}
+    fn add_byte_lookup_events_from_maps(
+        &mut self,
+        _: Vec<&HashMap<ByteLookupEvent, usize>>,
+    ) {
+    }
+}
 
 impl<F: PrimeField32> MachineAir<F> for CpuChip {
     type Record = ExecutionRecord;
@@ -53,13 +67,12 @@ impl<F: PrimeField32> MachineAir<F> for CpuChip {
                         cols.instruction.imm_c = F::one();
                         cols.is_syscall = F::one();
                     } else {
-                        let mut byte_lookup_events = Vec::new();
                         let event = &input.cpu_events[idx];
                         let instruction = &input.program.fetch(event.pc);
                         self.event_to_row(
                             event,
                             cols,
-                            &mut byte_lookup_events,
+                            &mut NullByteRecord,
                             input.public_values.execution_shard,
                             instruction,
                         );
@@ -74,26 +87,17 @@ impl<F: PrimeField32> MachineAir<F> for CpuChip {
 
     #[instrument(name = "generate cpu dependencies", level = "debug", skip_all)]
     fn generate_dependencies(&self, input: &ExecutionRecord, output: &mut ExecutionRecord) {
-        // Generate the trace rows for each event.
         let chunk_size = std::cmp::max(input.cpu_events.len() / num_cpus::get(), 1);
+        let shard = input.public_values.execution_shard;
 
         let blu_events: Vec<_> = input
             .cpu_events
             .par_chunks(chunk_size)
             .map(|ops: &[CpuEvent]| {
-                // The blu map stores shard -> map(byte lookup event -> multiplicity).
                 let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
                 ops.iter().for_each(|op| {
-                    let mut row = [F::zero(); NUM_CPU_COLS];
-                    let cols: &mut CpuCols<F> = row.as_mut_slice().borrow_mut();
                     let instruction = &input.program.fetch(op.pc);
-                    self.event_to_row::<F>(
-                        op,
-                        cols,
-                        &mut blu,
-                        input.public_values.execution_shard,
-                        instruction,
-                    );
+                    Self::collect_byte_lookups(op, &mut blu, shard, instruction);
                 });
                 blu
             })
@@ -112,6 +116,96 @@ impl<F: PrimeField32> MachineAir<F> for CpuChip {
 }
 
 impl CpuChip {
+    /// Collect byte lookup events directly from a CPU event without allocating CpuCols.
+    ///
+    /// This is a lightweight alternative to `event_to_row` used by `generate_dependencies`.
+    /// It produces identical byte lookup events but avoids allocating and populating the
+    /// full 180+ field CpuCols struct per event.
+    fn collect_byte_lookups(
+        event: &CpuEvent,
+        output: &mut impl ByteRecord,
+        shard: u32,
+        instruction: &Instruction,
+    ) {
+        // Shard/clk range checks (mirrors populate_shard_clk).
+        let clk_16bit_limb = (event.clk & 0xffff) as u16;
+        let clk_8bit_limb = ((event.clk >> 16) & 0xff) as u8;
+        output.add_byte_lookup_event(ByteLookupEvent::new(U16Range, shard as u16, 0, 0, 0));
+        output.add_byte_lookup_event(ByteLookupEvent::new(U16Range, clk_16bit_limb, 0, 0, 0));
+        output.add_byte_lookup_event(ByteLookupEvent::new(
+            ByteOpcode::U8Range,
+            0,
+            0,
+            0,
+            clk_8bit_limb,
+        ));
+
+        // Memory access time-diff range checks (mirrors populate_access).
+        // For ecall instructions, op_a lookups are discarded (sent to dummy vec in event_to_row).
+        if let Some(record) = event.a_record {
+            if !instruction.is_ecall_instruction() {
+                Self::collect_access_lookups(&record, output);
+            }
+        }
+        if let Some(MemoryRecordEnum::Read(record)) = event.b_record {
+            Self::collect_read_access_lookups(&record, output);
+        }
+        if let Some(MemoryRecordEnum::Read(record)) = event.c_record {
+            Self::collect_read_access_lookups(&record, output);
+        }
+
+        // a_bytes range checks (from op_a_access.access.value after populate).
+        let a_value = match event.a_record {
+            Some(ref r) => r.current_record().value,
+            None => event.a,
+        };
+        let a_bytes = a_value.to_le_bytes();
+        output.add_byte_lookup_event(ByteLookupEvent {
+            opcode: ByteOpcode::U8Range,
+            a1: 0,
+            a2: 0,
+            b: a_bytes[0],
+            c: a_bytes[1],
+        });
+        output.add_byte_lookup_event(ByteLookupEvent {
+            opcode: ByteOpcode::U8Range,
+            a1: 0,
+            a2: 0,
+            b: a_bytes[2],
+            c: a_bytes[3],
+        });
+    }
+
+    /// Compute time-diff range checks for a memory record (read or write).
+    #[inline(always)]
+    fn collect_access_lookups(record: &MemoryRecordEnum, output: &mut impl ByteRecord) {
+        let cur = record.current_record();
+        let prev = record.previous_record();
+        let use_clk = prev.shard == cur.shard;
+        let (prev_t, cur_t) = if use_clk {
+            (prev.timestamp, cur.timestamp)
+        } else {
+            (prev.shard, cur.shard)
+        };
+        let diff_minus_one = cur_t - prev_t - 1;
+        output.add_u16_range_check((diff_minus_one & 0xffff) as u16);
+        output.add_u8_range_check(0, ((diff_minus_one >> 16) & 0xff) as u8);
+    }
+
+    /// Compute time-diff range checks for a read record.
+    #[inline(always)]
+    fn collect_read_access_lookups(record: &MemoryReadRecord, output: &mut impl ByteRecord) {
+        let use_clk = record.prev_shard == record.shard;
+        let (prev_t, cur_t) = if use_clk {
+            (record.prev_timestamp, record.timestamp)
+        } else {
+            (record.prev_shard, record.shard)
+        };
+        let diff_minus_one = cur_t - prev_t - 1;
+        output.add_u16_range_check((diff_minus_one & 0xffff) as u16);
+        output.add_u8_range_check(0, ((diff_minus_one >> 16) & 0xff) as u8);
+    }
+
     /// Create a row from an event.
     fn event_to_row<F: PrimeField32>(
         &self,
