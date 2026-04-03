@@ -622,6 +622,11 @@ where
                                 pcs, &pk.data, &prep_sizes,
                             );
 
+                        // Precompute selectors grouped by (trace_log_n, quotient_size).
+                        // Chips sharing the same domain pair reuse the same selector data.
+                        let mut selector_cache: std::collections::HashMap<(usize, usize), Vec<u32>> =
+                            std::collections::HashMap::new();
+
                         for (i, quotient_domain) in
                             quotient_domains.as_slice().iter().enumerate()
                         {
@@ -652,6 +657,18 @@ where
                                     prep_lde_slices[index]
                                 });
 
+                            // Cache key: (trace_domain.log_n, quotient_domain.size)
+                            // These fully determine the selectors since domain.shift is always one().
+                            let sel_key = (bb_trace_domain.log_n, bb_quotient_domain.size());
+                            let cached_sels = selector_cache
+                                .entry(sel_key)
+                                .or_insert_with(|| {
+                                    crate::gpu_quotient::compute_selector_data(
+                                        bb_trace_domain,
+                                        bb_quotient_domain,
+                                    )
+                                });
+
                             // Try bitrev dispatch (avoids materialization).
                             let dispatch =
                                 crate::gpu_quotient::prepare_quotient_dispatch_bitrev(
@@ -672,6 +689,7 @@ where
                                     bb_perm_challenges,
                                     bb_alpha,
                                     bb_public_values,
+                                    Some(cached_sels.as_slice()),
                                     metal_state,
                                 );
 

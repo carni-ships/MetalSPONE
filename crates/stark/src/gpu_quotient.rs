@@ -158,11 +158,34 @@ where
     ))
 }
 
+/// Compute selector data for a (trace_domain, quotient_domain) pair.
+///
+/// Returns packed u32 selector data in Montgomery form: [is_first, is_last, is_transition, inv_zero]
+/// interleaved per quotient-domain row.
+pub fn compute_selector_data<D: PolynomialSpace<Val = BabyBear>>(
+    trace_domain: D,
+    quotient_domain: D,
+) -> Vec<u32> {
+    let quotient_size = quotient_domain.size();
+    let sels = trace_domain.selectors_on_coset(quotient_domain);
+    let mut selector_data = Vec::with_capacity(quotient_size * 4);
+    for i in 0..quotient_size {
+        selector_data.push(bb_to_raw(sels.is_first_row[i]));
+        selector_data.push(bb_to_raw(sels.is_last_row[i]));
+        selector_data.push(bb_to_raw(sels.is_transition[i]));
+        selector_data.push(bb_to_raw(sels.inv_zeroifier[i]));
+    }
+    selector_data
+}
+
 /// Prepare a GPU dispatch using raw LDE data in bit-reversed row order.
 ///
 /// Avoids materializing the quotient-domain evaluation entirely: the GPU kernel
 /// does bit-reversal indexing to read trace rows directly from the stored LDE.
 /// Saves hundreds of MB of allocation + copy per large chip.
+///
+/// `cached_selectors`: if provided, uses pre-computed selector data instead of
+/// computing selectors from scratch. Use `compute_selector_data` to precompute.
 ///
 /// Returns None if the chip isn't GPU-eligible or LDE sizes don't match quotient domain.
 #[allow(clippy::too_many_arguments)]
@@ -185,6 +208,7 @@ pub fn prepare_quotient_dispatch_bitrev<A, D: PolynomialSpace<Val = BabyBear>>(
     perm_challenges: &[Challenge],
     alpha: Challenge,
     public_values: &[BabyBear],
+    cached_selectors: Option<&[u32]>,
     metal_state: &metal_ntt::device::MetalState,
 ) -> Option<ChipDispatch>
 where
@@ -242,15 +266,18 @@ where
     };
     let perm_u32 = bb_as_u32(perm_lde);
 
-    // Selectors are in natural order (not from LDE).
-    let sels = trace_domain.selectors_on_coset(quotient_domain);
-    let mut selector_data = Vec::with_capacity(quotient_size * 4);
-    for i in 0..quotient_size {
-        selector_data.push(bb_to_raw(sels.is_first_row[i]));
-        selector_data.push(bb_to_raw(sels.is_last_row[i]));
-        selector_data.push(bb_to_raw(sels.is_transition[i]));
-        selector_data.push(bb_to_raw(sels.inv_zeroifier[i]));
-    }
+    // Use cached selectors if provided, otherwise compute fresh.
+    let selector_data_owned;
+    let selector_data: &[u32] = match cached_selectors {
+        Some(cached) => {
+            debug_assert_eq!(cached.len(), quotient_size * 4);
+            cached
+        }
+        None => {
+            selector_data_owned = compute_selector_data(trace_domain, quotient_domain);
+            &selector_data_owned
+        }
+    };
 
     Some(ChipDispatch::new_bitrev(
         metal_state,
@@ -263,7 +290,7 @@ where
         prep_lde_width.max(1) as u32,
         perm_u32,
         perm_lde_width as u32,
-        &selector_data,
+        selector_data,
         quotient_size as u32,
         next_step as u32,
     ))
