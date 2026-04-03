@@ -55,9 +55,9 @@ impl<F: PrimeField32> MachineAir<F> for MemoryGlobalChip {
     }
 
     fn generate_dependencies(&self, input: &ExecutionRecord, output: &mut ExecutionRecord) {
-        let mut memory_events = match self.kind {
-            MemoryChipType::Initialize => input.global_memory_initialize_events.clone(),
-            MemoryChipType::Finalize => input.global_memory_finalize_events.clone(),
+        let memory_events = match self.kind {
+            MemoryChipType::Initialize => &input.global_memory_initialize_events,
+            MemoryChipType::Finalize => &input.global_memory_finalize_events,
         };
 
         let is_receive = match self.kind {
@@ -65,9 +65,8 @@ impl<F: PrimeField32> MachineAir<F> for MemoryGlobalChip {
             MemoryChipType::Finalize => true,
         };
 
-        memory_events.sort_by_key(|event| event.addr);
-
-        let events = memory_events.into_iter().map(|event| {
+        // Events are pre-sorted by addr; no need to clone+sort.
+        let events = memory_events.iter().map(|event| {
             let interaction_shard = if is_receive { event.shard } else { 0 };
             let interaction_clk = if is_receive { event.timestamp } else { 0 };
             GlobalInteractionEvent {

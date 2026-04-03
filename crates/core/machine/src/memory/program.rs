@@ -112,9 +112,9 @@ impl<F: PrimeField32> MachineAir<F> for MemoryProgramChip {
     fn generate_dependencies(&self, input: &ExecutionRecord, output: &mut ExecutionRecord) {
         let program_memory = &input.program.memory_image;
 
-        let mut events = Vec::new();
-        program_memory.iter().for_each(|(&addr, &word)| {
-            events.push(GlobalInteractionEvent {
+        // Extend directly without intermediate Vec allocation.
+        output.global_interaction_events.extend(program_memory.iter().map(|(&addr, &word)| {
+            GlobalInteractionEvent {
                 message: [
                     0,
                     0,
@@ -126,10 +126,8 @@ impl<F: PrimeField32> MachineAir<F> for MemoryProgramChip {
                 ],
                 is_receive: false,
                 kind: InteractionKind::Memory as u8,
-            });
-        });
-
-        output.global_interaction_events.extend(events);
+            }
+        }));
     }
 
     fn generate_trace(
