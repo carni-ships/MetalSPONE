@@ -727,7 +727,17 @@ where
             .zip_eq(log_quotient_degrees.iter())
             .flat_map(|((quotient_domain, quotient_values), log_quotient_degree)| {
                 let quotient_degree = 1 << *log_quotient_degree;
-                let quotient_flat = RowMajorMatrix::new_col(quotient_values).flatten_to_base();
+                // Zero-copy flatten: SC::Challenge = BinomialExtensionField<BabyBear, 4>
+                // is repr(C) with [BabyBear; 4]. Reinterpret Vec<Challenge> as Vec<Val>
+                // with 4× the length, avoiding the element-by-element copy in flatten_to_base.
+                let ext_width = <SC::Challenge as AbstractExtensionField<Val<SC>>>::D;
+                let n = quotient_values.len();
+                let base_len = n * ext_width;
+                let base_cap = quotient_values.capacity() * ext_width;
+                let base_ptr = quotient_values.as_ptr() as *mut Val<SC>;
+                std::mem::forget(quotient_values);
+                let base_values = unsafe { Vec::from_raw_parts(base_ptr, base_len, base_cap) };
+                let quotient_flat = RowMajorMatrix::new(base_values, ext_width);
                 let quotient_chunks = quotient_domain.split_evals(quotient_degree, quotient_flat);
                 let qc_domains = quotient_domain.split_domains(quotient_degree);
                 qc_domains.into_iter().zip_eq(quotient_chunks)
