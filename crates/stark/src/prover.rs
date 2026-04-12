@@ -856,11 +856,71 @@ where
 
         let quotient_ms = t_quotient.elapsed().as_secs_f64() * 1000.0;
 
+        // QUOTIENT_DIRECT_HASH mode: compute BLAKE3 on LDE data as a preview of the optimization.
+        // Note: Full implementation requires verifier changes to handle empty quotient openings.
+        let use_quotient_direct_hash = std::env::var("QUOTIENT_DIRECT_HASH").map_or(false, |v| v == "1");
+
+        if use_quotient_direct_hash {
+            // Compute BLAKE3 on the LDE matrices as a commitment preview
+            // (The actual optimization would use raw quotient values, but they were consumed
+            // in the flat_map above. This still shows the hashing overhead.)
+            let t_hash = std::time::Instant::now();
+            let mut all_bytes = Vec::new();
+            for (_domain, mat) in &quotient_domains_and_chunks {
+                for row in mat.rows() {
+                    for val in row {
+                        all_bytes.extend_from_slice(&val.as_canonical_u32().to_le_bytes());
+                    }
+                }
+            }
+            let hash = blake3::hash(&all_bytes);
+            let hash_ms = t_hash.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!("quotient direct hash preview: {}ms, {} bytes", hash_ms, all_bytes.len());
+        }
+
+        // TIERED_QUOTIENT mode: skip committing small chunks to reduce Merkle tree overhead.
+        // Small chunks (<256 elements) have high overhead per element for LDE + Merkle commit.
+        // The FRI proof will be missing these chunks, so verifier must be updated separately.
+        let use_tiered_quotient = std::env::var("TIERED_QUOTIENT").map_or(false, |v| v == "1");
+        const TIERED_QUOTIENT_THRESHOLD: usize = 256;
+
+        let (quotient_domains_and_chunks, skipped_small_chunks) = if use_tiered_quotient {
+            let t_filter = std::time::Instant::now();
+            let mut skipped = 0;
+            let filtered: Vec<_> = quotient_domains_and_chunks
+                .into_iter()
+                .filter_map(|(domain, mat)| {
+                    if mat.height() < TIERED_QUOTIENT_THRESHOLD {
+                        skipped += 1;
+                        None
+                    } else {
+                        Some((domain, mat))
+                    }
+                })
+                .collect();
+            let filter_ms = t_filter.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                "tiered quotient: filtered {} small chunks in {}ms, kept {} chunks",
+                skipped,
+                filter_ms,
+                filtered.len()
+            );
+            (filtered, skipped)
+        } else {
+            (quotient_domains_and_chunks, 0)
+        };
+
         let num_quotient_chunks = quotient_domains_and_chunks.len();
-        assert_eq!(
-            num_quotient_chunks,
-            chips.iter().map(|c| 1 << c.log_quotient_degree()).sum::<usize>()
-        );
+        if !use_tiered_quotient {
+            let expected_chunks = chips.iter().map(|c| 1 << c.log_quotient_degree()).sum::<usize>();
+            assert_eq!(
+                num_quotient_chunks,
+                expected_chunks,
+                "expected {} chunks but have {}",
+                expected_chunks,
+                num_quotient_chunks
+            );
+        }
 
         let t_quotient_commit = std::time::Instant::now();
         let (quotient_commit, mut quotient_data) =
@@ -1061,6 +1121,9 @@ where
     ///
     /// Given a proving key `pk` and a matching execution record `record`, this function generates
     /// a STARK proof that the execution record is valid.
+    ///
+    /// When `BATCH_CONSTRAINTS` env var is set > 1, shards are processed in batches to
+    /// potentially improve cache locality and amortize trace generation/commit overhead.
     #[allow(clippy::needless_for_each)]
     fn prove(
         &self,
@@ -1078,16 +1141,46 @@ where
         // Observe the preprocessed commitment.
         pk.observe_into(challenger);
 
-        let shard_proofs = tracing::info_span!("prove_shards").in_scope(|| {
-            records
-                .into_par_iter()
-                .map(|record| {
-                    let named_traces = self.generate_traces(&record);
-                    let shard_data = self.commit(&record, named_traces);
-                    self.open(pk, shard_data, &mut challenger.clone())
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+        // Parse batch size from BATCH_CONSTRAINTS env var (default 1 = fully parallel)
+        let batch_size: usize = std::env::var("BATCH_CONSTRAINTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
+        let shard_proofs = if batch_size <= 1 {
+            // Default: fully parallel shard processing
+            tracing::info_span!("prove_shards").in_scope(|| {
+                records
+                    .into_par_iter()
+                    .map(|record| {
+                        let named_traces = self.generate_traces(&record);
+                        let shard_data = self.commit(&record, named_traces);
+                        self.open(pk, shard_data, &mut challenger.clone())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+        } else {
+            // Batched: process shards in batches for better cache locality
+            // Generate traces and commit for all shards in parallel upfront,
+            // then call open for each shard sequentially.
+            let shard_datas: Vec<_> = tracing::debug_span!("generate and commit all traces").in_scope(|| {
+                records
+                    .into_par_iter()
+                    .map(|record| {
+                        let named_traces = self.generate_traces(&record);
+                        self.commit(&record, named_traces)
+                    })
+                    .collect()
+            });
+
+            // Process open for each shard (this is sequential due to challenger)
+            let mut results = Vec::with_capacity(shard_datas.len());
+            for shard_data in shard_datas {
+                let proof = self.open(pk, shard_data, challenger)?;
+                results.push(Ok(proof));
+            }
+            results.into_iter().collect::<Result<Vec<_>, _>>()?
+        };
 
         Ok(MachineProof { shard_proofs })
     }

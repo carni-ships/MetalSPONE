@@ -66,6 +66,9 @@ version = "0.2.0-succinct"
 [dependencies.p3-util]
 version = "0.2.0-succinct"
 
+[dependencies.blake3]
+version = "1.5"
+
 [dependencies.serde]
 version = "1.0"
 features = [

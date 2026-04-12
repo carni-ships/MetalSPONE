@@ -4,6 +4,35 @@ use p3_commit::Mmcs;
 use p3_field::Field;
 use serde::{Deserialize, Serialize};
 
+/// SAFETY: CommitPhaseProofStep is Send if F: Send.
+/// All actual Mmcs implementations used in SP1 (MetalMmcs, FieldMerkleTreeMmcs, ExtensionMmcs)
+/// have Proof types that are Send (Vec<[F; N]> where F: Send). This impl assumes Proof: Send
+/// which holds for all SP1 Mmcs implementations.
+unsafe impl<F, M> Send for CommitPhaseProofStep<F, M>
+where
+    F: Field + Send,
+    M: Mmcs<F>,
+{
+}
+
+/// SAFETY: QueryProof is Send if F: Send.
+/// All actual Mmcs implementations used in SP1 have Proof types that are Send.
+unsafe impl<F, M> Send for QueryProof<F, M>
+where
+    F: Field + Send,
+    M: Mmcs<F>,
+{
+}
+
+/// SAFETY: FriProof is Send if F: Send and Witness: Send.
+unsafe impl<F, M, Witness> Send for FriProof<F, M, Witness>
+where
+    F: Field + Send,
+    M: Mmcs<F>,
+    Witness: Send,
+{
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(bound(
     serialize = "Witness: Serialize",

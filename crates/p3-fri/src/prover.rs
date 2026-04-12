@@ -34,22 +34,93 @@ where
         .map(|_| challenger.sample_bits(log_max_height))
         .collect();
 
+    let parallel_queries = std::env::var("PARALLEL_FOLD_QUERIES")
+        .ok()
+        .map_or(false, |v| v == "1");
+
     let query_proofs = info_span!("query phase").in_scope(|| {
-        query_indices
-            .iter()
-            .map(|&index| answer_query(config, &commit_phase_result.data, index))
-            .collect()
+        if parallel_queries {
+            prove_query_phase_parallel(config, commit_phase_result, &query_indices)
+        } else {
+            prove_query_phase_sequential(config, commit_phase_result, &query_indices)
+        }
     });
 
     (
         FriProof {
-            commit_phase_commits: commit_phase_result.commits,
-            query_proofs,
-            final_poly: commit_phase_result.final_poly,
+            commit_phase_commits: query_proofs.0,
+            query_proofs: query_proofs.1,
+            final_poly: query_proofs.2,
             pow_witness,
         },
         query_indices,
     )
+}
+
+/// Sequential query phase - works with any Mmcs implementation
+/// Returns (commits, query_proofs, final_poly)
+fn prove_query_phase_sequential<F, EF, M>(
+    config: &FriConfig<M>,
+    commit_phase_result: CommitPhaseResult<EF, M>,
+    query_indices: &[usize],
+) -> (Vec<M::Commitment>, Vec<QueryProof<EF, M>>, EF)
+where
+    F: Field,
+    EF: TwoAdicField + ExtensionField<F>,
+    M: Mmcs<EF>,
+{
+    let query_proofs: Vec<QueryProof<EF, M>> = query_indices
+        .iter()
+        .map(|&index| answer_query(config, &commit_phase_result.data, index))
+        .collect();
+
+    (
+        commit_phase_result.commits,
+        query_proofs,
+        commit_phase_result.final_poly,
+    )
+}
+
+/// Parallel query phase - requires M: Sync and M::ProverData: Sync
+/// Only called when PARALLEL_FOLD_QUERIES=1 is set
+/// Returns (commits, query_proofs, final_poly)
+#[cfg(feature = "parallel_fold")]
+fn prove_query_phase_parallel<F, EF, M>(
+    config: &FriConfig<M>,
+    commit_phase_result: CommitPhaseResult<EF, M>,
+    query_indices: &[usize],
+) -> (Vec<M::Commitment>, Vec<QueryProof<EF, M>>, EF)
+where
+    F: Field,
+    EF: TwoAdicField + ExtensionField<F>,
+    M: Mmcs<EF> + Sync,
+    M::ProverData<DenseMatrix<EF>>: Sync,
+{
+    let commits = commit_phase_result.commits.clone();
+    let final_poly = commit_phase_result.final_poly;
+
+    let query_proofs: Vec<QueryProof<EF, M>> = query_indices
+        .par_iter()
+        .map(|&index| answer_query(config, &commit_phase_result.data, index))
+        .collect();
+
+    (commits, query_proofs, final_poly)
+}
+
+/// Fallback for sequential when parallel_fold feature is not enabled
+#[cfg(not(feature = "parallel_fold"))]
+fn prove_query_phase_parallel<F, EF, M>(
+    config: &FriConfig<M>,
+    commit_phase_result: CommitPhaseResult<EF, M>,
+    query_indices: &[usize],
+) -> (Vec<M::Commitment>, Vec<QueryProof<EF, M>>, EF)
+where
+    F: Field,
+    EF: TwoAdicField + ExtensionField<F>,
+    M: Mmcs<EF>,
+{
+    // Just delegate to sequential
+    prove_query_phase_sequential(config, commit_phase_result, query_indices)
 }
 
 fn answer_query<F, M>(
